@@ -7,7 +7,10 @@ $zones_page_render_error = null;
 try {
     // --- START OF ORIGINAL PAGE CONTENT ---
 ?>
-<script>window.bs_bootstrap = <?php echo json_encode($data); ?>;</script>
+<script>
+window.bs_bootstrap = <?php echo json_encode($data); ?>;
+window.broadstreet_zone_settings_nonce = '<?php echo wp_create_nonce('broadstreet_zone_settings_nonce'); ?>';
+</script>
 <div id="main" ng-app="bs_zones">
       <?php Broadstreet_View::load('admin/global/header') ?>
       <div class="left_column" ng-controller="ZoneCtrl">

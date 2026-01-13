@@ -829,11 +829,29 @@ class Broadstreet_Core
     }
 
     public function adminMenuBusinessCallback() {
+        // Handle POSTed settings securely
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            // Require capability
+            if (!current_user_can('manage_options')) {
+                wp_die('Permission denied');
+            }
 
-        if (isset($_POST['featured_business_image'])) {
-            $featured_image = Broadstreet_Utility::featuredBusinessImage($_POST['featured_business_image']);
+            // Verify nonce for the businesses settings form
+            check_admin_referer('broadstreet_business_nonce');
+
+            // Sanitize and persist the featured image setting
+            if (isset($_POST['featured_business_image'])) {
+                $featured_image_value = sanitize_text_field($_POST['featured_business_image']);
+                $featured_image = Broadstreet_Utility::featuredBusinessImage($featured_image_value);
+            } else {
+                $featured_image = Broadstreet_Utility::featuredBusinessImage();
+            }
         } else {
-            $featured_image = Broadstreet_Utility::featuredBusinessImage();
+            if (isset($_POST['featured_business_image'])) {
+                $featured_image = Broadstreet_Utility::featuredBusinessImage($_POST['featured_business_image']);
+            } else {
+                $featured_image = Broadstreet_Utility::featuredBusinessImage();
+            }
         }
 
         Broadstreet_View::load('admin/businesses', array('featured_image' => $featured_image));
@@ -1289,6 +1307,9 @@ class Broadstreet_Core
     {
         if(isset($_POST['bs_submit']))
         {
+            // Define URL fields that should use esc_url_raw for sanitization
+            $url_fields = array('bs_website', 'bs_menu', 'bs_twitter', 'bs_facebook', 'bs_gplus', 'bs_yelp', 'bs_offer_link');
+
             foreach(self::$_businessDefaults as $key => $value)
             {
                 // Special handling for video content - only allow video and iframe tags to prevent XSS attacks
@@ -1374,10 +1395,22 @@ class Broadstreet_Core
                     continue;
                 }
 
-                if(isset($_POST[$key]))
-                    Broadstreet_Utility::setPostMeta($post_id, $key, is_string($_POST[$key]) ? trim($_POST[$key]) : $_POST[$key]);
-                elseif($key == 'bs_images')
+                if(isset($_POST[$key])) {
+                    // Sanitize input based on field type to prevent XSS attacks
+                    if (is_array($_POST[$key])) {
+                        // Handle array fields (like bs_images)
+                        $sanitized_value = array_map('sanitize_text_field', $_POST[$key]);
+                    } elseif (in_array($key, $url_fields)) {
+                        // URL fields - use esc_url_raw for database storage
+                        $sanitized_value = esc_url_raw(trim($_POST[$key]));
+                    } else {
+                        // Text fields - use sanitize_text_field to strip tags and encode special chars
+                        $sanitized_value = sanitize_text_field(trim($_POST[$key]));
+                    }
+                    Broadstreet_Utility::setPostMeta($post_id, $key, $sanitized_value);
+                } elseif($key == 'bs_images') {
                     Broadstreet_Utility::setPostMeta($post_id, $key, self::$_businessDefaults[$key]);
+                }
             }
         }
     }
