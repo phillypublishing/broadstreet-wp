@@ -39,6 +39,12 @@ jobs:
           find . -path ./.git -prune -o -type f -name '*.php' -print0 \
             | xargs -0 -n1 php -l
 
+      - name: Run PHP smoke tests
+        run: |
+          for test_file in tests/php/*.php; do
+            php "$test_file"
+          done
+
   php-compat:
     name: PHP compatibility (7.2-8.4)
     runs-on: ubuntu-latest
@@ -63,3 +69,34 @@ jobs:
           .github/vendor/bin/phpcs -p -n
           --standard=.github/phpcs.xml.dist
           broadstreet.php Broadstreet/
+
+  editor:
+    name: Block editor build and tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the plugin
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Check Node.js and npm versions
+        run: npm run check:engines
+
+      - name: Lint editor sources and package metadata
+        run: npm run lint
+
+      - name: Run editor extension smoke tests
+        run: npm test
+
+      - name: Verify committed production build
+        run: npm run check:build
+
+      - name: Verify runtime-only release archive
+        run: npm run check:package

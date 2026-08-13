@@ -1,0 +1,46 @@
+{
+	"name": "broadstreet",
+	"version": "1.53.3",
+	"description": "Broadstreet WordPress plugin block-editor tooling",
+	"author": "Broadstreet",
+	"license": "GPL-2.0-or-later",
+	"keywords": [
+		"wordpress",
+		"plugin",
+		"block-editor"
+	],
+	"homepage": "https://broadstreetads.com/",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/phillypublishing/broadstreet-wp.git"
+	},
+	"bugs": {
+		"url": "https://github.com/phillypublishing/broadstreet-wp/issues"
+	},
+	"private": true,
+	"engines": {
+		"node": ">=22.23.1 <23",
+		"npm": ">=10.9.0 <11"
+	},
+	"packageManager": "npm@10.9.8",
+	"devDependencies": {
+		"@wordpress/plugins": "7.40.1",
+		"@wordpress/scripts": "31.5.1",
+		"adm-zip": "0.5.18",
+		"typescript": "5.9.3"
+	},
+	"scripts": {
+		"build": "wp-scripts build src/editor.js --output-path=build",
+		"check:build": "npm run build && node scripts/check-build.mjs",
+		"check:engines": "wp-scripts check-engines",
+		"check:package": "npm run package:plugin && node scripts/check-plugin-package.mjs",
+		"dev": "npm start",
+		"start": "wp-scripts start src/editor.js --output-path=build",
+		"lint": "npm run lint:js && npm run lint:package",
+		"lint:js": "wp-scripts lint-js src tests/js scripts",
+		"lint:package": "wp-scripts lint-pkg-json",
+		"package:plugin": "npm run build && node scripts/package-plugin.mjs",
+		"test": "npm run test:unit",
+		"test:unit": "wp-scripts test-unit-js --runInBand"
+	}
+}

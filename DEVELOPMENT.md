@@ -1,0 +1,46 @@
+# Development
+
+## Block editor toolchain
+
+The block-editor sources use the WordPress 7.0 package line and the standard
+`@wordpress/scripts` commands. Node.js is pinned in `.nvmrc`, npm is recorded in
+`package.json`, and all JavaScript dependencies are locked by
+`package-lock.json`. No global Node tools are required.
+
+Start from a fresh checkout with:
+
+```sh
+npm ci
+npm test
+npm run lint
+npm run build
+```
+
+Use `npm run dev` (or its standard `npm start` alias) while developing to
+rebuild `src/editor.js` into `build/` on changes. Development builds may contain
+source maps; run `npm run build` before committing.
+
+## Build output policy
+
+`src/` is authored source. `build/` is distributable output and **is committed**
+so a checkout, GitHub source archive, or WordPress installation does not need
+Node.js at runtime. Every source change must include the production build from
+`npm run build`, including the generated `build/editor.asset.php` dependency and
+version metadata. PHP reads that file instead of maintaining dependency handles
+or cache versions manually.
+
+CI runs `npm run check:build`, which rebuilds from the lockfile-backed toolchain
+and fails if `build/` is missing, untracked, or different from the committed
+output.
+
+## Release artifact
+
+Run `npm run check:package` to create and verify `broadstreet.zip`. The packager
+uses an explicit runtime allowlist and stable entry ordering, permissions, and
+timestamps. It packages only `broadstreet.php`, `Broadstreet/`, `build/`, the
+license, and the WordPress readme. The check builds the same archive twice,
+compares its SHA-256 digest, and rejects source maps or development paths such
+as `node_modules`, `src`, `tests`, `scripts`, and `.github`.
+
+The generated zip is ignored by Git. Attach that verified artifact to a release;
+do not publish a working tree that contains development dependencies.

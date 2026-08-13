@@ -3,3 +3,5 @@ Broadstreet/Logs/*.txt
 .DS_Store
 .github/vendor/
 .github/docs/
+node_modules/
+broadstreet.zip
