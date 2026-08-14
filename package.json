@@ -38,6 +38,7 @@
 		"typescript": "5.9.3"
 	},
 	"scripts": {
+		"artifact:plugin": "node scripts/build-plugin-artifact.mjs",
 		"build": "wp-scripts build src/editor.js --output-path=build",
 		"check:build": "npm run build && node scripts/check-build.mjs",
 		"check:engines": "wp-scripts check-engines",
@@ -49,6 +50,7 @@
 		"lint:package": "wp-scripts lint-pkg-json",
 		"package:plugin": "npm run build && node scripts/package-plugin.mjs",
 		"test": "npm run test:unit",
+		"test:artifact": "bash tests/plugin-artifact.test.sh",
 		"test:unit": "wp-scripts test-unit-js --runInBand"
 	}
 }

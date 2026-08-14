@@ -64,6 +64,7 @@ const trackedRuntimeFiles = spawnSync(
 		'-z',
 		'--',
 		'Broadstreet',
+		'build',
 		'broadstreet.php',
 		'LICENSE.txt',
 		'readme.txt',
@@ -81,8 +82,6 @@ for ( const relativePath of trackedRuntimeFiles.stdout
 	collectParentDirectories( relativePath );
 	collectRuntimePath( relativePath );
 }
-
-collectRuntimePath( 'build' );
 
 for ( const relativePath of files ) {
 	collectParentDirectories( relativePath );

@@ -51,8 +51,16 @@ license, and the WordPress readme. The check builds the same archive twice,
 compares its SHA-256 digest, and rejects source maps or development paths such
 as `node_modules`, `src`, `tests`, `scripts`, and `.github`.
 
-The generated zip is ignored by Git. Attach that verified artifact to a release;
-do not publish a working tree that contains development dependencies.
+The generated zip is ignored by Git. The Block editor build and tests job also
+publishes a 30-day GitHub Actions artifact containing an installable ZIP, its
+SHA-256 checksum, and a provenance manifest. The ZIP filename includes the
+plugin version and first 12 characters of the source commit. Use that artifact
+for staging instead of a GitHub source archive, and verify its checksum before
+installing it.
+
+Run `npm run artifact:plugin` to create the same version- and commit-addressed
+bundle under `dist/`. The builder refuses a dirty checkout by default. Do not
+publish a working tree that contains development dependencies.
 
 ## Sponsored tracker ownership
 
@@ -73,3 +81,22 @@ Legacy tracker IDs are stamped in place only when an authoritative postmeta
 lookup finds the canonical post plus, optionally, drafts whose `_dp_original`
 all point to it. Ambiguous references stop in `needs_action`; they are never
 resolved from matching titles or URLs.
+
+### Rare ambiguous Broadstreet requests
+
+Broadstreet does not document an idempotency key for tracker creation or a
+network-wide lookup by WordPress post ID. If a request may have succeeded but
+WordPress did not receive or persist the response, the reconciler reports
+`needs_action` instead of risking a duplicate remote tracker. This is a rare
+operator safeguard, not part of the normal publishing workflow.
+
+When it occurs, stop retrying the post and inspect the Broadstreet dashboard
+using the post title, URL, advertiser, and error time. Record the exact tracker
+and advertiser IDs if one tracker exists. If none or multiple exist, record that
+result rather than clearing Broadstreet's reconciliation metadata. The current
+plugin intentionally has no generic retry for an outcome-unknown create.
+
+Until a staging incident demonstrates the need for dedicated recovery tooling,
+dashboard inspection plus the
+[guarded-recovery backlog](https://github.com/phillypublishing/wp-realtime-poc/issues/22)
+is the recovery plan. Do not repair the state with ad-hoc post-meta edits.

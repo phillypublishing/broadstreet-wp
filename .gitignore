@@ -5,3 +5,4 @@ Broadstreet/Logs/*.txt
 .github/docs/
 node_modules/
 broadstreet.zip
+dist/

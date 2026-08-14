@@ -95,8 +95,19 @@ jobs:
       - name: Run editor extension smoke tests
         run: npm test
 
-      - name: Verify committed production build
-        run: npm run check:build
+      - name: Build and verify installable plugin artifact
+        env:
+          BROADSTREET_ARTIFACT_ALLOW_DIRTY: 0
+        run: npm run test:artifact -- "${RUNNER_TEMP}/broadstreet-artifact"
 
-      - name: Verify runtime-only release archive
-        run: npm run check:package
+      - name: Upload installable plugin artifact
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: broadstreet-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/broadstreet-artifact/*.zip
+            ${{ runner.temp }}/broadstreet-artifact/*.sha256
+            ${{ runner.temp }}/broadstreet-artifact/plugin-artifact-manifest.json
+          if-no-files-found: error
+          retention-days: 30
