@@ -41,6 +41,7 @@ const entries = new AdmZip( archivePath )
 	.map( ( entry ) => entry.entryName );
 const requiredFiles = [
 	'broadstreet/broadstreet.php',
+	'broadstreet/Broadstreet/ZoneController.php',
 	'broadstreet/build/editor.js',
 	'broadstreet/build/editor.asset.php',
 ];

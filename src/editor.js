@@ -142,6 +142,122 @@ export function BroadstreetAdVisibilityPanel() {
 }
 
 /**
+ * Read-only cached zone reference for post and page editors.
+ */
+export function BroadstreetZoneInfoPanel() {
+	const editor = useSelect( ( select ) => {
+		const store = select( 'core/editor' );
+		if ( ! store ) {
+			return { postId: 0, postType: '' };
+		}
+
+		return {
+			postId: store.getCurrentPostId(),
+			postType: store.getCurrentPostType(),
+		};
+	}, [] );
+	const [ zones, setZones ] = useState( [] );
+	const [ catalogState, setCatalogState ] = useState( 'idle' );
+	const zoneRequest = useRef( 0 );
+	const currentPostId = useRef( editor.postId );
+	const currentPostType = useRef( editor.postType );
+	const supported = [ 'post', 'page' ].includes( editor.postType );
+	currentPostId.current = editor.postId;
+	currentPostType.current = editor.postType;
+
+	useEffect( () => {
+		const requestId = ++zoneRequest.current;
+		if ( ! supported || ! editor.postId ) {
+			setZones( [] );
+			setCatalogState( 'idle' );
+			return;
+		}
+
+		const postId = editor.postId;
+		const postType = editor.postType;
+		setZones( [] );
+		setCatalogState( 'loading' );
+		apiFetch( {
+			path: `/broadstreet/v1/zones?post_id=${ encodeURIComponent(
+				postId
+			) }`,
+		} )
+			.then( ( items ) => {
+				if (
+					requestId !== zoneRequest.current ||
+					postId !== currentPostId.current ||
+					postType !== currentPostType.current
+				) {
+					return;
+				}
+
+				setZones( Array.isArray( items ) ? items : [] );
+				setCatalogState( 'ready' );
+			} )
+			.catch( () => {
+				if (
+					requestId === zoneRequest.current &&
+					postId === currentPostId.current &&
+					postType === currentPostType.current
+				) {
+					setCatalogState( 'error' );
+				}
+			} );
+	}, [ editor.postId, editor.postType, supported ] );
+
+	if ( ! supported ) {
+		return null;
+	}
+
+	return (
+		<PluginDocumentSettingPanel
+			name="broadstreet-zone-info"
+			title={ __( 'Broadstreet Zone Info', 'broadstreet_textdomain' ) }
+		>
+			<p>
+				{ __(
+					'Here is a list of the zones you have registered in Broadstreet. To embed a zone in the post, paste in its shortcode. You can also have zones auto-injected on the',
+					'broadstreet_textdomain'
+				) }{ ' ' }
+				<a href="admin.php?page=Broadstreet-Zone-Options">
+					{ __( 'zone settings page', 'broadstreet_textdomain' ) }
+				</a>
+				{ '.' }
+			</p>
+
+			{ catalogState === 'loading' && <Spinner /> }
+			{ catalogState === 'error' && (
+				<Notice status="error" isDismissible={ false }>
+					{ __(
+						'Broadstreet zones could not be loaded. Try again.',
+						'broadstreet_textdomain'
+					) }
+				</Notice>
+			) }
+			{ catalogState === 'ready' && zones.length === 0 && (
+				<p>
+					{ __(
+						"You either have no zones or Broadstreet isn't configured correctly. Go to 'Settings', then 'Broadstreet', and make sure your access token is correct, and make sure you have zones set up.",
+						'broadstreet_textdomain'
+					) }
+				</p>
+			) }
+			{ catalogState === 'ready' && zones.length > 0 && (
+				<ul>
+					{ zones.map( ( zone ) => (
+						<li key={ zone.id }>
+							<strong>{ zone.name }</strong>
+							<br />
+							<code>{ zone.shortcode }</code>
+						</li>
+					) ) }
+				</ul>
+			) }
+		</PluginDocumentSettingPanel>
+	);
+}
+
+/**
  * Sponsored-content feature for the shared Broadstreet document-settings root.
  */
 export function BroadstreetSponsorPanel() {
@@ -556,6 +672,7 @@ export function BroadstreetDocumentSettings() {
 		<>
 			<BroadstreetAdVisibilityPanel />
 			<BroadstreetSponsorPanel />
+			<BroadstreetZoneInfoPanel />
 		</>
 	);
 }

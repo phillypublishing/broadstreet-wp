@@ -18,6 +18,7 @@ import {
 	BroadstreetAdVisibilityPanel,
 	BroadstreetSponsorPanel,
 	BroadstreetDocumentSettings,
+	BroadstreetZoneInfoPanel,
 	SPONSOR_ADVERTISER_KEY,
 	SPONSOR_ENABLED_KEY,
 } from '../../src/editor';
@@ -107,6 +108,7 @@ jest.mock( '@wordpress/data', () => ( {
 
 const selectEditor = () => ( {
 	getCurrentPostId: () => editorState.postId,
+	getCurrentPostType: () => editorState.postType,
 	getEditedPostAttribute: ( attribute ) =>
 		attribute === 'meta' ? editorState.meta : undefined,
 	isAutosavingPost: () => editorState.isAutosaving,
@@ -124,6 +126,16 @@ const installStoreMocks = () => {
 
 const installApiResponses = ( overrides = {} ) => {
 	apiFetch.mockImplementation( ( request ) => {
+		if ( request.path.startsWith( '/broadstreet/v1/zones' ) ) {
+			return Promise.resolve( [
+				{
+					id: '3',
+					name: 'Article Inline',
+					shortcode: '[broadstreet zone="3"]',
+				},
+			] );
+		}
+
 		if ( request.path.startsWith( '/broadstreet/v1/advertisers' ) ) {
 			if ( request.method === 'POST' ) {
 				return Promise.resolve( { id: '41', name: request.data.name } );
@@ -166,6 +178,7 @@ describe( 'Broadstreet sponsored-content editor extension', () => {
 		apiFetch.mockClear();
 		editorState = {
 			postId: 42,
+			postType: 'post',
 			meta: {
 				[ AD_VISIBILITY_KEY ]: false,
 				[ SPONSOR_ENABLED_KEY ]: '1',
@@ -190,7 +203,7 @@ describe( 'Broadstreet sponsored-content editor extension', () => {
 		expect( settings.render ).toBe( BroadstreetDocumentSettings );
 	} );
 
-	test( 'composes visibility and sponsorship from the shared root', async () => {
+	test( 'composes all document settings from the shared root', async () => {
 		render( <BroadstreetDocumentSettings /> );
 
 		expect(
@@ -201,6 +214,8 @@ describe( 'Broadstreet sponsored-content editor extension', () => {
 		).toBeInTheDocument();
 		await screen.findByText( 'Broadstreet tracking is synchronized.' );
 		await screen.findByRole( 'combobox', { name: 'Advertiser' } );
+		await screen.findByRole( 'region', { name: 'Broadstreet Zone Info' } );
+		await screen.findByText( 'Article Inline' );
 	} );
 
 	test( 'reads current shared meta directly on every store-driven render', async () => {
@@ -503,6 +518,7 @@ describe( 'Broadstreet Disable Ads editor extension', () => {
 		apiFetch.mockClear();
 		editorState = {
 			postId: 42,
+			postType: 'post',
 			meta: {
 				[ AD_VISIBILITY_KEY ]: '1',
 			},
@@ -547,6 +563,132 @@ describe( 'Broadstreet Disable Ads editor extension', () => {
 		const { container } = render( <BroadstreetAdVisibilityPanel /> );
 
 		expect( container ).toBeEmptyDOMElement();
+		expect( editPost ).not.toHaveBeenCalled();
+	} );
+} );
+
+describe( 'Broadstreet Zone Info editor extension', () => {
+	beforeEach( () => {
+		apiFetch.mockClear();
+		editorState = {
+			postId: 42,
+			postType: 'post',
+			meta: {},
+			isSaving: false,
+			isAutosaving: false,
+		};
+		editPost = jest.fn();
+		installStoreMocks();
+	} );
+
+	test( 'loads and renders only the exact read-only zone display contract', async () => {
+		apiFetch.mockResolvedValue( [
+			{
+				id: '3',
+				name: 'Alpha & Sons',
+				shortcode: '[broadstreet zone="3"]',
+			},
+			{
+				id: '20',
+				name: 'Zulu <script>',
+				shortcode: '[broadstreet zone="20"]',
+			},
+		] );
+
+		const { container } = render( <BroadstreetZoneInfoPanel /> );
+
+		expect( screen.getByText( 'Loading…' ) ).toBeInTheDocument();
+		await screen.findByText( 'Alpha & Sons' );
+		expect(
+			screen.getByText( '[broadstreet zone="3"]' )
+		).toBeInTheDocument();
+		expect( screen.getByText( 'Zulu <script>' ) ).toBeInTheDocument();
+		expect( container.querySelector( 'script' ) ).toBeNull();
+		expect(
+			screen.getByRole( 'link', { name: 'zone settings page' } )
+		).toHaveAttribute( 'href', 'admin.php?page=Broadstreet-Zone-Options' );
+		expect( apiFetch ).toHaveBeenCalledTimes( 1 );
+		expect( apiFetch ).toHaveBeenCalledWith( {
+			path: '/broadstreet/v1/zones?post_id=42',
+		} );
+		expect( editPost ).not.toHaveBeenCalled();
+	} );
+
+	test( 'preserves the legacy empty and unconfigured guidance', async () => {
+		apiFetch.mockResolvedValue( [] );
+		render( <BroadstreetZoneInfoPanel /> );
+
+		await screen.findByText(
+			/You either have no zones or Broadstreet isn't configured correctly/
+		);
+		expect( editPost ).not.toHaveBeenCalled();
+	} );
+
+	test( 'uses a fixed safe message when the private catalog is unavailable', async () => {
+		apiFetch.mockRejectedValue(
+			new Error( 'access_token=raw-secret vendor failure' )
+		);
+		render( <BroadstreetZoneInfoPanel /> );
+
+		await waitFor( () =>
+			expect( screen.getByRole( 'alert' ) ).toHaveTextContent(
+				'Broadstreet zones could not be loaded. Try again.'
+			)
+		);
+		expect( screen.getByRole( 'alert' ) ).not.toHaveTextContent(
+			'raw-secret'
+		);
+		expect( editPost ).not.toHaveBeenCalled();
+	} );
+
+	test.each( [ 'story', 'bs_business' ] )(
+		'does not render or request zones for unsupported %s editors',
+		( postType ) => {
+			editorState.postType = postType;
+			const { container } = render( <BroadstreetZoneInfoPanel /> );
+
+			expect( container ).toBeEmptyDOMElement();
+			expect( apiFetch ).not.toHaveBeenCalled();
+			expect( editPost ).not.toHaveBeenCalled();
+		}
+	);
+
+	test( 'ignores a delayed catalog response after navigating to another post', async () => {
+		const zones42 = deferred();
+		const zones43 = deferred();
+		apiFetch.mockImplementation( ( request ) =>
+			request.path.includes( 'post_id=43' )
+				? zones43.promise
+				: zones42.promise
+		);
+
+		const view = render( <BroadstreetZoneInfoPanel /> );
+		editorState.postId = 43;
+		view.rerender( <BroadstreetZoneInfoPanel /> );
+
+		await act( async () => {
+			zones43.resolve( [
+				{
+					id: '43',
+					name: 'Current zone',
+					shortcode: '[broadstreet zone="43"]',
+				},
+			] );
+		} );
+		await screen.findByText( 'Current zone' );
+
+		await act( async () => {
+			zones42.resolve( [
+				{
+					id: '42',
+					name: 'Stale zone',
+					shortcode: '[broadstreet zone="42"]',
+				},
+			] );
+		} );
+
+		expect( screen.queryByText( 'Stale zone' ) ).not.toBeInTheDocument();
+		expect( screen.getByText( 'Current zone' ) ).toBeInTheDocument();
 		expect( editPost ).not.toHaveBeenCalled();
 	} );
 } );

@@ -21,6 +21,7 @@ require_once dirname(__FILE__) . '/Exception.php';
 require_once dirname(__FILE__) . '/OptionLock.php';
 require_once dirname(__FILE__) . '/SponsorReconciler.php';
 require_once dirname(__FILE__) . '/SponsorController.php';
+require_once dirname(__FILE__) . '/ZoneController.php';
 require_once dirname(__FILE__) . '/Vendor/Broadstreet.php';
 
 if (! class_exists('Broadstreet_Core')):
@@ -44,6 +45,7 @@ class Broadstreet_Core
     CONST META_ADVERTISER_CREATE_ATTEMPT = '_bs_sponsor_advertiser_create_attempt';
 
     protected $sponsorController;
+    protected $zoneController;
 
     public static $_disableAds = false;
     public static $_rssCount = 0;
@@ -162,6 +164,7 @@ class Broadstreet_Core
         add_action('init', array($this, 'registerSponsorMeta'), 20);
         add_action('init', array($this, 'registerAdVisibilityMeta'), 20);
         add_action('rest_api_init', array($this, 'registerSponsorRoutes'));
+        add_action('rest_api_init', array($this, 'registerZoneRoutes'));
         add_action(Broadstreet_Sponsor_Reconciler::RETRY_HOOK, array($this, 'reconcileSponsorPost'));
         add_filter('update_post_metadata', array($this, 'captureSponsorAdvertiserBeforeUpdate'), 10, 5);
         add_action('admin_init', 	array($this, 'adminInitCallback' ));        
@@ -677,6 +680,41 @@ class Broadstreet_Core
         $this->getSponsorController()->registerRoutes();
     }
 
+    /**
+     * Narrow authenticated zone catalog used only by post/page editors.
+     */
+    public function registerZoneRoutes()
+    {
+        $this->getZoneController()->registerRoutes();
+    }
+
+    public function canEditZonePost($request)
+    {
+        return $this->getZoneController()->canEditPost($request);
+    }
+
+    public function getEditorZones($request)
+    {
+        return $this->getZoneController()->getZones($request);
+    }
+
+    /**
+     * Zone-catalog seam for focused tests without replacing other clients.
+     */
+    public function getEditorZoneCache()
+    {
+        return Broadstreet_Utility::getZoneCache();
+    }
+
+    public function getZoneController()
+    {
+        if (!($this->zoneController instanceof Broadstreet_Zone_Controller)) {
+            $this->zoneController = new Broadstreet_Zone_Controller($this);
+        }
+
+        return $this->zoneController;
+    }
+
     public function canEditSponsorPost($request)
     {
         return $this->getSponsorController()->canEditPost($request);
@@ -768,14 +806,20 @@ class Broadstreet_Core
             'broadstreet_sectionid',
             __( 'Broadstreet Zone Info', 'broadstreet_textdomain' ),
             array($this, 'broadstreetInfoBox'),
-            'post'
+            'post',
+            'advanced',
+            'default',
+            array('__back_compat_meta_box' => true)
         );
 
         add_meta_box(
             'broadstreet_sectionid',
             __( 'Broadstreet Zone Info', 'broadstreet_textdomain'),
             array($this, 'broadstreetInfoBox'),
-            'page'
+            'page',
+            'advanced',
+            'default',
+            array('__back_compat_meta_box' => true)
         );
 
         /**

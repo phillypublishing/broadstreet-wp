@@ -41,8 +41,12 @@ function apply_filters($hook, $value)
     return $value;
 }
 
-function get_option()
+function get_option($key = null)
 {
+    if ($key === 'Broadstreet_Biz_Enabled') {
+        return true;
+    }
+
     return false;
 }
 
@@ -102,6 +106,7 @@ function add_meta_box($id, $title, $callback, $screen, $context = 'advanced', $p
     $broadstreet_visibility_meta_boxes[] = array(
         'id' => $id,
         'screen' => $screen,
+        'callback' => $callback,
         'callback_args' => $callback_args,
     );
 }
@@ -217,5 +222,28 @@ foreach ($visibility_boxes as $box) {
         );
     }
 }
+
+$zone_info_boxes = array_values(array_filter($broadstreet_visibility_meta_boxes, function ($box) {
+    return $box['id'] === 'broadstreet_sectionid'
+        && is_array($box['callback'])
+        && $box['callback'][1] === 'broadstreetInfoBox';
+}));
+broadstreet_assert_same(2, count($zone_info_boxes), 'Zone Info should retain exactly its post and page registrations.');
+foreach ($zone_info_boxes as $box) {
+    broadstreet_assert_same(
+        array('__back_compat_meta_box' => true),
+        $box['callback_args'],
+        'Only the converted post/page Zone Info callbacks should be hidden from Gutenberg.'
+    );
+}
+
+$business_boxes = array_values(array_filter($broadstreet_visibility_meta_boxes, function ($box) {
+    return $box['id'] === 'broadstreet_sectionid'
+        && is_array($box['callback'])
+        && $box['callback'][1] === 'broadstreetBusinessBox';
+}));
+broadstreet_assert_same(1, count($business_boxes), 'The same-ID Business Details box should remain registered.');
+broadstreet_assert_same('bs_business', $business_boxes[0]['screen'], 'Business Details should remain scoped to bs_business.');
+broadstreet_assert_same(null, $business_boxes[0]['callback_args'], 'Business Details must not be hidden as a converted Zone Info box.');
 
 echo "Ad visibility meta registration smoke test passed.\n";
