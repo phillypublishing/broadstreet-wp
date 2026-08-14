@@ -168,6 +168,7 @@ class Broadstreet_Core
         add_action(Broadstreet_Sponsor_Reconciler::RETRY_HOOK, array($this, 'reconcileSponsorPost'));
         add_filter('update_post_metadata', array($this, 'captureSponsorAdvertiserBeforeUpdate'), 10, 5);
         add_action('admin_init', 	array($this, 'adminInitCallback' ));        
+        add_action('wp', array($this, 'captureAdVisibilityState'));
         add_action('wp_enqueue_scripts',          array($this, 'addCDNScript' ));
         add_filter('script_loader_tag',          array($this, 'finalizeZoneTag' ));
         add_action('init',          array($this, 'businessIndexSidebar' ));
@@ -955,10 +956,9 @@ class Broadstreet_Core
     {
         $code = '';
 
-        # while we're in the post, capture the disabled status of the ads
-        if (is_singular()) {
-            self::$_disableAds = Broadstreet_Utility::getPostMeta(get_queried_object_id(), 'bs_ads_disabled') == '1';
-        }
+        // Keep direct or unusually ordered calls robust while sharing the same
+        // state capture used before front-end content begins rendering.
+        $this->captureAdVisibilityState();
 
         $placement_settings = Broadstreet_Utility::getPlacementSettings();
         if (property_exists($placement_settings, 'use_old_tags') && $placement_settings->use_old_tags) {
@@ -977,6 +977,15 @@ class Broadstreet_Core
         }
 
         wp_add_inline_script('broadstreet-init', "$code", 'after');
+    }
+
+    /**
+     * Capture per-post ad visibility after WordPress has resolved the main query.
+     */
+    public function captureAdVisibilityState()
+    {
+        self::$_disableAds = is_singular()
+            && Broadstreet_Utility::getPostMeta(get_queried_object_id(), 'bs_ads_disabled') == '1';
     }
 
     /**

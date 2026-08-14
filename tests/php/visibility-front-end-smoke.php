@@ -13,9 +13,14 @@ class WP_Widget
 
 $broadstreet_visibility_meta = '';
 $broadstreet_inline_scripts = array();
+$broadstreet_visibility_actions = array();
+$broadstreet_is_singular = true;
 
-function add_action()
+function add_action($hook, $callback, $priority = 10, $accepted_args = 1)
 {
+    global $broadstreet_visibility_actions;
+
+    $broadstreet_visibility_actions[] = array($hook, $callback, $priority, $accepted_args);
 }
 
 function add_filter()
@@ -58,7 +63,9 @@ function maybe_unserialize($value)
 
 function is_singular()
 {
-    return true;
+    global $broadstreet_is_singular;
+
+    return $broadstreet_is_singular;
 }
 
 function get_queried_object_id()
@@ -86,9 +93,26 @@ require_once $plugin_root . '/Broadstreet/Core.php';
 
 $reflection = new ReflectionClass('Broadstreet_Core');
 $core = $reflection->newInstanceWithoutConstructor();
+$core->execute();
+
+$visibility_front_end_hooks = array_values(array_filter($broadstreet_visibility_actions, function ($action) {
+    return $action[0] === 'wp'
+        && is_array($action[1])
+        && $action[1][1] === 'captureAdVisibilityState';
+}));
+broadstreet_assert_same(1, count($visibility_front_end_hooks), 'Ad visibility should be captured once when the main query is available.');
+broadstreet_assert_same(10, $visibility_front_end_hooks[0][2], 'Ad visibility should use the standard wp hook priority.');
 
 $broadstreet_visibility_meta = '1';
 Broadstreet_Core::$_disableAds = false;
+call_user_func($visibility_front_end_hooks[0][1]);
+broadstreet_assert_same(true, Broadstreet_Core::$_disableAds, 'The wp hook should capture historical string 1 before block-theme content renders.');
+broadstreet_assert_same(
+    '<!-- Broadstreet plugin: Ads disabled on this post -->',
+    Broadstreet_Utility::getZoneCode(7),
+    'Zone rendering before wp_enqueue_scripts should honor the stored visibility state.'
+);
+
 $core->writeInitCode();
 broadstreet_assert_same(true, Broadstreet_Core::$_disableAds, 'Historical string 1 should disable ads.');
 broadstreet_assert_same(array(), $broadstreet_inline_scripts, 'Disabled posts should not receive Broadstreet initialization.');
@@ -116,6 +140,10 @@ broadstreet_assert_same('', $powered_by_output, 'Disabled posts should not recei
 
 $broadstreet_visibility_meta = '';
 Broadstreet_Core::$_disableAds = true;
+$broadstreet_is_singular = false;
+call_user_func($visibility_front_end_hooks[0][1]);
+broadstreet_assert_same(false, Broadstreet_Core::$_disableAds, 'Non-singular requests should deterministically clear stale visibility state.');
+$broadstreet_is_singular = true;
 $core->writeInitCode();
 broadstreet_assert_same(false, Broadstreet_Core::$_disableAds, 'Historical empty values should leave ads enabled.');
 broadstreet_assert_same(
