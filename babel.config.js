@@ -1,0 +1,13 @@
+module.exports = {
+	presets: [ '@wordpress/babel-preset-default' ],
+	plugins: [
+		[
+			'@babel/plugin-transform-react-jsx',
+			{
+				runtime: 'classic',
+				pragma: 'createElement',
+				pragmaFrag: 'Fragment',
+			},
+		],
+	],
+};

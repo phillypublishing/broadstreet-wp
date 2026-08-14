@@ -98,6 +98,11 @@ broadstreet_assert_same(
     'Unexpected editor script URL.'
 );
 broadstreet_assert_same($asset['dependencies'], $broadstreet_enqueued_scripts[0]['dependencies'], 'Generated dependencies were not used.');
+broadstreet_assert_same(
+    false,
+    in_array('react-jsx-runtime', $asset['dependencies'], true),
+    'The WordPress 6.4 build must use the classic JSX transform.'
+);
 broadstreet_assert_same($asset['version'], $broadstreet_enqueued_scripts[0]['version'], 'Generated version was not used.');
 broadstreet_assert_same(true, $broadstreet_enqueued_scripts[0]['in_footer'], 'The editor script should load in the footer.');
 broadstreet_assert_same(
