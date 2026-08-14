@@ -1238,15 +1238,6 @@ class Broadstreet_Utility
             $targets['pagetype'][] = 'not_home_page';
         }
 
-        if (is_user_logged_in()) {
-            $keywords[] = 'is_logged_in';
-            $user = wp_get_current_user();
-            $roles = ( array ) $user->roles;
-            foreach ($roles as $role) {
-                $keywords[] = $role;
-            }
-        }
-
         # categories
         $slugs = self::getAllAdSlugs();
         $categories = array ();
