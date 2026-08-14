@@ -58,7 +58,8 @@ class Broadstreet_Utility
             $args = json_encode($args);
         }
 
-        $code = "window.broadstreetKeywords = [" . Broadstreet_Utility::getAllAdKeywordsString() . "]\n";
+        $code = "window.broadstreetKeywords = window.broadstreetKeywords ?? []\n";
+        $code .= "window.broadstreetKeywords = [...window.broadstreetKeywords, " . Broadstreet_Utility::getAllAdKeywordsString() . "]\n";
         $code .= "window.broadstreetTargets = " . json_encode(Broadstreet_Utility::getTargets()) . ";\n";
 
         $code .= "\nwindow.broadstreet = window.broadstreet || { run: [] };window.broadstreet.run.push(function () {\n";
@@ -1147,13 +1148,28 @@ class Broadstreet_Utility
                 }
             }
 
-            $slugs[] = $post->post_name;
+            $tags = wp_get_post_tags($id);
+            if (!$tags) {
+                $tags = array();
+            };
+            foreach ($tags as $tag) {
+                $t = get_tag($tag);
+
+                if (property_exists($t, 'slug')) {
+                    $slugs[] = $t->slug;
+                }
+            }
+
+            if (!empty($post->post_name)) {
+                $slugs[] = $post->post_name;
+            }
+            $slugs[] = 'post-' . $id;
             $slugs[] = get_post_type();
         }
 
         if (is_category() || is_archive()) {
             $cat = get_query_var('cat');
-            $cat = get_category ($cat);
+            $cat = get_category($cat);
 
             if (property_exists($cat, 'slug')) {
                 $slugs[] = $cat->slug;
@@ -1215,6 +1231,15 @@ class Broadstreet_Utility
             $targets['pagetype'][] = 'not_home_page';
         }
 
+        if (is_user_logged_in()) {
+            $keywords[] = 'is_logged_in';
+            $user = wp_get_current_user();
+            $roles = ( array ) $user->roles;
+            foreach ($roles as $role) {
+                $keywords[] = $role;
+            }
+        }
+
         # categories
         $slugs = self::getAllAdSlugs();
         $categories = array ();
@@ -1249,6 +1274,15 @@ class Broadstreet_Utility
          if(is_front_page()) {
              $keywords = array('is_home_page', 'is_landing_page', 'not_article_page');
          }
+
+        if (is_user_logged_in()) {
+            $keywords[] = 'is_logged_in';
+            $user = wp_get_current_user();
+            $roles = ( array ) $user->roles;
+            foreach ($roles as $role) {
+                $keywords[] = $role;
+            }
+        }
 
         $slugs = self::getAllAdSlugs();
 
