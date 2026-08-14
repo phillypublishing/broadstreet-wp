@@ -14,6 +14,8 @@ import { createElement } from '@wordpress/element';
 import { registerPlugin } from '@wordpress/plugins';
 
 import {
+	AD_VISIBILITY_KEY,
+	BroadstreetAdVisibilityPanel,
 	BroadstreetSponsorPanel,
 	BroadstreetDocumentSettings,
 	SPONSOR_ADVERTISER_KEY,
@@ -77,17 +79,22 @@ jest.mock( '@wordpress/components', () => ( {
 			/>
 		</label>
 	),
-	ToggleControl: ( { label, checked, onChange } ) => (
-		<label htmlFor="broadstreet-test-toggle">
-			{ label }
-			<input
-				id="broadstreet-test-toggle"
-				type="checkbox"
-				checked={ checked }
-				onChange={ ( event ) => onChange( event.target.checked ) }
-			/>
-		</label>
-	),
+	ToggleControl: ( { label, checked, onChange } ) => {
+		const id = `broadstreet-test-toggle-${ label
+			.toLowerCase()
+			.replaceAll( ' ', '-' ) }`;
+		return (
+			<label htmlFor={ id }>
+				{ label }
+				<input
+					id={ id }
+					type="checkbox"
+					checked={ checked }
+					onChange={ ( event ) => onChange( event.target.checked ) }
+				/>
+			</label>
+		);
+	},
 } ) );
 
 let editorState;
@@ -160,6 +167,7 @@ describe( 'Broadstreet sponsored-content editor extension', () => {
 		editorState = {
 			postId: 42,
 			meta: {
+				[ AD_VISIBILITY_KEY ]: false,
 				[ SPONSOR_ENABLED_KEY ]: '1',
 				[ SPONSOR_ADVERTISER_KEY ]: '20',
 			},
@@ -180,6 +188,19 @@ describe( 'Broadstreet sponsored-content editor extension', () => {
 
 		expect( name ).toBe( 'broadstreet-editor' );
 		expect( settings.render ).toBe( BroadstreetDocumentSettings );
+	} );
+
+	test( 'composes visibility and sponsorship from the shared root', async () => {
+		render( <BroadstreetDocumentSettings /> );
+
+		expect(
+			screen.getByRole( 'checkbox', { name: 'Disable ads on this post' } )
+		).toBeInTheDocument();
+		expect(
+			screen.getByRole( 'checkbox', { name: 'Performance tracking' } )
+		).toBeInTheDocument();
+		await screen.findByText( 'Broadstreet tracking is synchronized.' );
+		await screen.findByRole( 'combobox', { name: 'Advertiser' } );
 	} );
 
 	test( 'reads current shared meta directly on every store-driven render', async () => {
@@ -474,5 +495,58 @@ describe( 'Broadstreet sponsored-content editor extension', () => {
 		await screen.findByText( 'Visible after cron' );
 		expect( statusReads ).toBe( 3 );
 		jest.useRealTimers();
+	} );
+} );
+
+describe( 'Broadstreet Disable Ads editor extension', () => {
+	beforeEach( () => {
+		apiFetch.mockClear();
+		editorState = {
+			postId: 42,
+			meta: {
+				[ AD_VISIBILITY_KEY ]: '1',
+			},
+			isSaving: false,
+			isAutosaving: false,
+		};
+		editPost = jest.fn( ( patch ) => {
+			editorState.meta = { ...editorState.meta, ...patch.meta };
+		} );
+		installStoreMocks();
+	} );
+
+	test( 'reads historical values and follows peer store updates without reload', () => {
+		const view = render( <BroadstreetAdVisibilityPanel /> );
+		const toggle = screen.getByRole( 'checkbox', {
+			name: 'Disable ads on this post',
+		} );
+
+		expect( toggle ).toBeChecked();
+
+		// Simulate a collaborator updating the shared core/editor meta state.
+		editorState.meta[ AD_VISIBILITY_KEY ] = '';
+		view.rerender( <BroadstreetAdVisibilityPanel /> );
+		expect(
+			screen.getByRole( 'checkbox', {
+				name: 'Disable ads on this post',
+			} )
+		).not.toBeChecked();
+
+		fireEvent.click(
+			screen.getByRole( 'checkbox', {
+				name: 'Disable ads on this post',
+			} )
+		);
+		expect( editPost ).toHaveBeenLastCalledWith( {
+			meta: { [ AD_VISIBILITY_KEY ]: true },
+		} );
+	} );
+
+	test( 'does not render when the post type lacks registered shared meta', () => {
+		editorState.meta = {};
+		const { container } = render( <BroadstreetAdVisibilityPanel /> );
+
+		expect( container ).toBeEmptyDOMElement();
+		expect( editPost ).not.toHaveBeenCalled();
 	} );
 } );

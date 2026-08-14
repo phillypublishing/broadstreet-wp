@@ -160,6 +160,7 @@ class Broadstreet_Core
         add_action('admin_enqueue_scripts', array($this, 'adminStyles'));
         add_action('enqueue_block_editor_assets', array($this, 'enqueueEditorAssets'));
         add_action('init', array($this, 'registerSponsorMeta'), 20);
+        add_action('init', array($this, 'registerAdVisibilityMeta'), 20);
         add_action('rest_api_init', array($this, 'registerSponsorRoutes'));
         add_action(Broadstreet_Sponsor_Reconciler::RETRY_HOOK, array($this, 'reconcileSponsorPost'));
         add_filter('update_post_metadata', array($this, 'captureSponsorAdvertiserBeforeUpdate'), 10, 5);
@@ -502,6 +503,35 @@ class Broadstreet_Core
     }
 
     /**
+     * Register the historical per-post ad visibility flag as shared,
+     * revisioned block-editor state.
+     */
+    public function registerAdVisibilityMeta()
+    {
+        foreach ($this->getSponsorEditorPostTypes() as $post_type) {
+            register_post_meta($post_type, 'bs_ads_disabled', array(
+                'type' => 'boolean',
+                'single' => true,
+                'default' => false,
+                'show_in_rest' => true,
+                'revisions_enabled' => true,
+                'sanitize_callback' => array($this, 'sanitizeAdVisibilityBoolean'),
+                'auth_callback' => array($this, 'authorizeAdVisibilityMeta'),
+            ));
+        }
+    }
+
+    public function sanitizeAdVisibilityBoolean($value)
+    {
+        return in_array($value, array(true, 1, '1', 'true'), true);
+    }
+
+    public function authorizeAdVisibilityMeta($allowed, $meta_key, $post_id)
+    {
+        return current_user_can('edit_post', (int) $post_id);
+    }
+
+    /**
      * Register editor-owned sponsor fields as shared revisioned meta. The
      * remote advertisement ID remains deliberately unregistered/server-owned.
      */
@@ -775,13 +805,17 @@ class Broadstreet_Core
         }
 
         foreach ( $screens as $screen ) {
+            $callback_args = in_array($screen, $editor_post_types, true)
+                ? array('__back_compat_meta_box' => true)
+                : null;
             add_meta_box(
                 'broadstreet_visibility_sectionid',
                 __( '<span class="dashicons dashicons-format-image"></span> Broadstreet Options', 'broadstreet_textdomain'),
                 array($this, 'broadstreetAdVisibilityBox'),
                 $screen,
                 apply_filters('broadstreet_options_meta_box_context', 'side', $screen),
-                apply_filters('broadstreet_options_meta_box_priority', 'default', $screen)
+                apply_filters('broadstreet_options_meta_box_priority', 'default', $screen),
+                $callback_args
             );
         }
 
@@ -1442,19 +1476,19 @@ class Broadstreet_Core
      * Allow user to enable and disable ads on a given page
      */
     public function saveAdVisibilityMeta($post_id) {
-        if(isset($_POST['bs_ads_disabled_submit'])) {
-            # save settings
-            foreach(self::$_visibilityDefaults as $key => $value)
-            {
-                if(isset($_POST[$key])) {
-                    Broadstreet_Utility::setPostMeta($post_id, $key, is_string($_POST[$key]) ? trim($_POST[$key]) : $_POST[$key]);
-                }
-            }
-
-            if (!isset($_POST['bs_ads_disabled'])) {
-                Broadstreet_Utility::setPostMeta($post_id, 'bs_ads_disabled', '');
-            }
+        if (!isset($_POST['bs_ads_disabled_submit'])
+            || wp_is_post_revision($post_id)
+            || wp_is_post_autosave($post_id)
+            || !isset($_POST['broadstreetadvisibility'])
+            || !wp_verify_nonce($_POST['broadstreetadvisibility'], plugin_basename(__FILE__))
+            || !current_user_can('edit_post', (int) $post_id)) {
+            return;
         }
+
+        $disabled = isset($_POST['bs_ads_disabled'])
+            && $this->sanitizeAdVisibilityBoolean($_POST['bs_ads_disabled']);
+
+        Broadstreet_Utility::setPostMeta($post_id, 'bs_ads_disabled', $disabled ? '1' : '');
     }
 
 	/**

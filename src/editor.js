@@ -25,6 +25,7 @@ import { registerPlugin } from '@wordpress/plugins';
 
 export const SPONSOR_ENABLED_KEY = 'bs_sponsor_is_sponsored';
 export const SPONSOR_ADVERTISER_KEY = 'bs_sponsor_advertiser_id';
+export const AD_VISIBILITY_KEY = 'bs_ads_disabled';
 
 const EMPTY_STATUS = {
 	state: 'idle',
@@ -100,6 +101,45 @@ const advertiserCreateErrorStatus = ( code ) => {
 			};
 	}
 };
+
+/**
+ * Per-post ad visibility feature for the shared document-settings root.
+ */
+export function BroadstreetAdVisibilityPanel() {
+	const meta = useSelect( ( select ) => {
+		const store = select( 'core/editor' );
+		return store ? store.getEditedPostAttribute( 'meta' ) || {} : {};
+	}, [] );
+	const { editPost } = useDispatch( 'core/editor' );
+
+	if ( ! Object.prototype.hasOwnProperty.call( meta, AD_VISIBILITY_KEY ) ) {
+		return null;
+	}
+
+	return (
+		<PluginDocumentSettingPanel
+			name="broadstreet-options"
+			title={ __( 'Broadstreet Options', 'broadstreet_textdomain' ) }
+		>
+			<ToggleControl
+				label={ __(
+					'Disable ads on this post',
+					'broadstreet_textdomain'
+				) }
+				help={ __(
+					'Prevent Broadstreet ads from rendering on this post.',
+					'broadstreet_textdomain'
+				) }
+				checked={ isSponsoredValue( meta[ AD_VISIBILITY_KEY ] ) }
+				onChange={ ( disabled ) =>
+					editPost( {
+						meta: { [ AD_VISIBILITY_KEY ]: Boolean( disabled ) },
+					} )
+				}
+			/>
+		</PluginDocumentSettingPanel>
+	);
+}
 
 /**
  * Sponsored-content feature for the shared Broadstreet document-settings root.
@@ -512,7 +552,12 @@ export function BroadstreetSponsorPanel() {
  * Sole plugin entry point. Future document-setting features compose here.
  */
 export function BroadstreetDocumentSettings() {
-	return <BroadstreetSponsorPanel />;
+	return (
+		<>
+			<BroadstreetAdVisibilityPanel />
+			<BroadstreetSponsorPanel />
+		</>
+	);
 }
 
 registerPlugin( 'broadstreet-editor', {
