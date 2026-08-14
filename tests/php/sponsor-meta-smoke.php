@@ -212,6 +212,32 @@ broadstreet_assert_same(
     get_post_meta(42, 'bs_sponsor_advertisement_id', true),
     'Internal reconciliation should still be able to persist server-owned advertisement IDs.'
 );
+foreach (array(
+    'bs_sponsor_advertisement_id',
+    Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST,
+) as $server_meta_key) {
+    broadstreet_assert_same(
+        true,
+        apply_filters('is_protected_meta', false, $server_meta_key, 'post'),
+        'Every server-owned sponsor key should be hidden from generic Custom Fields.'
+    );
+    broadstreet_assert_same(
+        false,
+        apply_filters('auth_post_meta_' . $server_meta_key, true, $server_meta_key, 42, 9, 'edit_post_meta', array()),
+        'Every server-owned sponsor key should deny generic meta writes.'
+    );
+    broadstreet_assert_same(
+        array('do_not_allow'),
+        apply_filters('map_meta_cap', array('edit_posts'), 'edit_post_meta', 9, array(42, $server_meta_key)),
+        'Every server-owned sponsor key should deny capability-mapped writes.'
+    );
+}
+update_post_meta(42, Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST, '42');
+broadstreet_assert_same(
+    '42',
+    get_post_meta(42, Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST, true),
+    'Internal reconciliation should still be able to persist remote-owner stamps.'
+);
 
 broadstreet_assert_same(
     array('post', 'page', 'story'),

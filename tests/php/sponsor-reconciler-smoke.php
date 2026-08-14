@@ -29,6 +29,7 @@ $broadstreet_steal_lock_after_network = false;
 class Broadstreet_Test_Sponsor_DB
 {
     public $options = 'wp_options';
+    public $postmeta = 'wp_postmeta';
 
     public function insert($table, $data, $format = null)
     {
@@ -58,15 +59,32 @@ class Broadstreet_Test_Sponsor_DB
 
     public function prepare($query, $value)
     {
-        return array($query, $value);
+        return array($query, array_slice(func_get_args(), 1));
     }
 
     public function get_var($prepared)
     {
         global $broadstreet_options;
-        return isset($broadstreet_options[$prepared[1]])
-            ? $broadstreet_options[$prepared[1]]
+        $key = $prepared[1][0];
+        return isset($broadstreet_options[$key])
+            ? $broadstreet_options[$key]
             : null;
+    }
+
+    public function get_col($prepared)
+    {
+        global $broadstreet_meta;
+        $meta_key = $prepared[1][0];
+        $meta_value = (string) $prepared[1][1];
+        $post_ids = array();
+
+        foreach ($broadstreet_meta as $post_id => $meta) {
+            if (isset($meta[$meta_key]) && (string) $meta[$meta_key] === $meta_value) {
+                $post_ids[] = (string) $post_id;
+            }
+        }
+
+        return array_values(array_unique($post_ids));
     }
 
     public function suppress_errors($suppress = true)
@@ -102,6 +120,14 @@ function update_post_meta($post_id, $key, $value)
     }
 
     $broadstreet_meta[$post_id][$key] = $value;
+    return true;
+}
+
+function delete_post_meta($post_id, $key)
+{
+    global $broadstreet_meta;
+
+    unset($broadstreet_meta[$post_id][$key]);
     return true;
 }
 
@@ -319,6 +345,7 @@ function broadstreet_reset_sponsor_fixture()
     $broadstreet_steal_lock_after_network = false;
     $broadstreet_posts = array(
         42 => array('status' => 'draft', 'title' => 'Sponsor story'),
+        43 => array('status' => 'draft', 'title' => 'Sponsor story copy'),
     );
 }
 
@@ -501,6 +528,55 @@ broadstreet_assert_same('queued', $second_contention['state'], 'Repeated content
 broadstreet_assert_same(1, count($broadstreet_scheduled), 'Concurrent saves should coalesce to one retry event.');
 broadstreet_assert_same(array(), $api->calls, 'Contending requests must not call the vendor.');
 
+// The canonical original and its Rewrite & Republish draft must contend on the
+// same lock instead of mutating one remote tracker concurrently.
+broadstreet_reset_sponsor_fixture();
+$broadstreet_meta[42] = array(
+    'bs_sponsor_is_sponsored' => '1',
+    'bs_sponsor_advertiser_id' => '31',
+    'bs_sponsor_advertisement_id' => '905',
+    Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST => '42',
+);
+$broadstreet_meta[43] = $broadstreet_meta[42];
+$broadstreet_meta[43]['_dp_original'] = '42';
+$broadstreet_options['_broadstreet_sponsor_lock_42'] = maybe_serialize(array(
+    'token' => 'canonical-owner-request',
+    'created_at' => time(),
+));
+$api = new Broadstreet_Fake_Sponsor_Client();
+$reconciler = new Broadstreet_Sponsor_Reconciler($api, '99');
+$original_contention = $reconciler->reconcile(42);
+$rewrite_contention = $reconciler->reconcile(43);
+broadstreet_assert_same('queued', $original_contention['state'], 'The original should respect its canonical lock.');
+broadstreet_assert_same('queued', $rewrite_contention['state'], 'The rewrite draft should contend on the original canonical lock.');
+broadstreet_assert_same(array(), $api->calls, 'Canonical lock contention must make no vendor calls.');
+
+// Canonical identity is re-read after lock acquisition. If _dp_original changes,
+// release must still target the acquired key and defer without vendor calls.
+broadstreet_reset_sponsor_fixture();
+$broadstreet_meta[43] = array(
+    'bs_sponsor_is_sponsored' => '1',
+    'bs_sponsor_advertiser_id' => '31',
+    'bs_sponsor_advertisement_id' => '',
+    '_dp_original' => '42',
+);
+$broadstreet_lock_mutation = function ($key) use (&$broadstreet_meta, &$broadstreet_options) {
+    if ($key === '_broadstreet_sponsor_lock_42') {
+        $broadstreet_meta[43]['_dp_original'] = '99';
+        $broadstreet_options['_broadstreet_sponsor_lock_99'] = maybe_serialize(array(
+            'token' => 'new-canonical-owner',
+            'created_at' => time(),
+        ));
+    }
+};
+$api = new Broadstreet_Fake_Sponsor_Client();
+$reconciler = new Broadstreet_Sponsor_Reconciler($api, '99');
+$identity_changed = $reconciler->reconcile(43);
+broadstreet_assert_same('queued', $identity_changed['state'], 'A canonical identity change should defer reconciliation.');
+broadstreet_assert_same(false, isset($broadstreet_options['_broadstreet_sponsor_lock_42']), 'Release should delete the exact acquired canonical lock.');
+broadstreet_assert_same(true, isset($broadstreet_options['_broadstreet_sponsor_lock_99']), 'Release must not delete a lock for the new canonical identity.');
+broadstreet_assert_same(array(), $api->calls, 'Canonical identity changes must make no vendor calls.');
+
 // Scheduled publication and _dp_original keep the canonical public URL behavior.
 broadstreet_reset_sponsor_fixture();
 $broadstreet_posts[42]['status'] = 'publish';
@@ -509,6 +585,7 @@ $broadstreet_meta[42] = array(
     'bs_sponsor_advertiser_id' => '31',
     'bs_sponsor_advertisement_id' => '905',
     '_bs_sponsor_remote_advertiser_id' => '31',
+    Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST => '8',
     '_dp_original' => '8',
 );
 $api = new Broadstreet_Fake_Sponsor_Client();
@@ -682,5 +759,176 @@ $first_status = $reconciler->recordStatus(42, 'waiting', 'Select an advertiser.'
 $second_status = $reconciler->recordStatus(42, 'waiting', 'Select an advertiser.', false);
 broadstreet_assert_same($first_status, $second_status, 'Unchanged status should preserve its original timestamp.');
 broadstreet_assert_same(1, $broadstreet_meta_update_counts[42][Broadstreet_Sponsor_Reconciler::META_STATUS], 'Unchanged status should not rewrite meta.');
+
+// A generic duplicate must branch away from the copied remote tracker without
+// mutating either the original post or its remote advertisement.
+broadstreet_reset_sponsor_fixture();
+$broadstreet_meta[42] = array(
+    'bs_sponsor_is_sponsored' => '1',
+    'bs_sponsor_advertiser_id' => '17',
+    'bs_sponsor_advertisement_id' => '902',
+    Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST => '42',
+    Broadstreet_Sponsor_Reconciler::META_REMOTE_ADVERTISER => '17',
+    Broadstreet_Sponsor_Reconciler::META_FINGERPRINT => 'original-fingerprint',
+);
+$broadstreet_meta[43] = $broadstreet_meta[42];
+$api = new Broadstreet_Fake_Sponsor_Client();
+$reconciler = new Broadstreet_Sponsor_Reconciler($api, '99');
+$result = $reconciler->reconcile(43);
+$create_calls = array_values(array_filter($api->calls, function ($call) {
+    return $call[0] === 'createAdvertisement';
+}));
+$update_calls = array_values(array_filter($api->calls, function ($call) {
+    return $call[0] === 'updateAdvertisement';
+}));
+broadstreet_assert_same('synced', $result['state'], 'A proven generic copy should receive its own guarded tracker.');
+broadstreet_assert_same('902', $broadstreet_meta[42]['bs_sponsor_advertisement_id'], 'Duplicate reconciliation must not alter the original post tracker.');
+broadstreet_assert_same('42', $broadstreet_meta[42][Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST], 'Duplicate reconciliation must not alter the original owner stamp.');
+broadstreet_assert_same('7001', $broadstreet_meta[43]['bs_sponsor_advertisement_id'], 'A generic copy should store a distinct tracker ID.');
+broadstreet_assert_same('43', $broadstreet_meta[43][Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST], 'The duplicate should own only its newly created tracker.');
+broadstreet_assert_same(1, count($create_calls), 'A generic copy should dispatch exactly one guarded create.');
+broadstreet_assert_same('43', (string) $create_calls[0][5]['post_id'], 'The duplicate create should identify the duplicate post.');
+broadstreet_assert_same(0, count($update_calls), 'A generic copy must never update the copied tracker.');
+
+// A Yoast Rewrite & Republish draft shares the original post's canonical owner
+// identity and may update that tracker while retaining the original permalink.
+broadstreet_reset_sponsor_fixture();
+$broadstreet_meta[42] = array(
+    'bs_sponsor_is_sponsored' => '1',
+    'bs_sponsor_advertiser_id' => '17',
+    'bs_sponsor_advertisement_id' => '902',
+    Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST => '42',
+);
+$broadstreet_meta[43] = $broadstreet_meta[42];
+$broadstreet_meta[43]['_dp_original'] = '42';
+$api = new Broadstreet_Fake_Sponsor_Client();
+$reconciler = new Broadstreet_Sponsor_Reconciler($api, '99');
+$result = $reconciler->reconcile(43);
+broadstreet_assert_same('synced', $result['state'], 'A republish draft should reconcile through the original canonical owner.');
+broadstreet_assert_same('902', $broadstreet_meta[43]['bs_sponsor_advertisement_id'], 'Republish reconciliation should retain the canonical tracker ID.');
+broadstreet_assert_same('42', $broadstreet_meta[43][Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST], 'A republish draft must retain the original canonical owner stamp.');
+$republish_updates = array_values(array_filter($api->calls, function ($call) {
+    return $call[0] === 'updateAdvertisement';
+}));
+broadstreet_assert_same(1, count($republish_updates), 'A republish draft should update the canonical tracker once.');
+broadstreet_assert_same('902', $republish_updates[0][3], 'A republish draft must update the original tracker, not create a replacement.');
+broadstreet_assert_same('https://example.test/original-42', $republish_updates[0][4]['stencil_inputs']['url'], 'Republish updates should retain the original public permalink.');
+broadstreet_assert_same(0, count(array_filter($api->calls, function ($call) { return $call[0] === 'createAdvertisement'; })), 'A republish draft with a canonical tracker must not create another tracker.');
+
+// A republish draft with blank local tracker state hydrates the canonical
+// original tracker before updating it; it must never create independently.
+broadstreet_reset_sponsor_fixture();
+$broadstreet_meta[42] = array(
+    'bs_sponsor_is_sponsored' => '1',
+    'bs_sponsor_advertiser_id' => '17',
+    'bs_sponsor_advertisement_id' => '902',
+    Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST => '42',
+    Broadstreet_Sponsor_Reconciler::META_REMOTE_ADVERTISER => '17',
+);
+$broadstreet_meta[43] = array(
+    'bs_sponsor_is_sponsored' => '1',
+    'bs_sponsor_advertiser_id' => '17',
+    'bs_sponsor_advertisement_id' => '',
+    '_dp_original' => '42',
+);
+$api = new Broadstreet_Fake_Sponsor_Client();
+$reconciler = new Broadstreet_Sponsor_Reconciler($api, '99');
+$result = $reconciler->reconcile(43);
+$create_calls = array_values(array_filter($api->calls, function ($call) {
+    return $call[0] === 'createAdvertisement';
+}));
+$hydrate_updates = array_values(array_filter($api->calls, function ($call) {
+    return $call[0] === 'updateAdvertisement';
+}));
+broadstreet_assert_same('synced', $result['state'], 'A blank republish draft should hydrate and update the canonical tracker.');
+broadstreet_assert_same('902', $broadstreet_meta[43]['bs_sponsor_advertisement_id'], 'Hydration should copy the canonical tracker ID into the draft.');
+broadstreet_assert_same('42', $broadstreet_meta[43][Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST], 'Hydration should retain the original canonical owner identity.');
+broadstreet_assert_same('17', $broadstreet_meta[43][Broadstreet_Sponsor_Reconciler::META_REMOTE_ADVERTISER], 'Hydration should copy the canonical remote advertiser state.');
+broadstreet_assert_same(0, count($create_calls), 'A blank republish draft must never create independently.');
+broadstreet_assert_same(1, count($hydrate_updates), 'A hydrated republish draft should update the canonical tracker once.');
+broadstreet_assert_same('https://example.test/original-42', $hydrate_updates[0][4]['stencil_inputs']['url'], 'Hydrated republish updates should retain the original public permalink.');
+
+// Without a provable canonical tracker, a blank republish draft fails closed
+// before any network or advertisement request.
+broadstreet_reset_sponsor_fixture();
+$broadstreet_meta[42] = array(
+    'bs_sponsor_is_sponsored' => '1',
+    'bs_sponsor_advertiser_id' => '17',
+    'bs_sponsor_advertisement_id' => '',
+);
+$broadstreet_meta[43] = array(
+    'bs_sponsor_is_sponsored' => '1',
+    'bs_sponsor_advertiser_id' => '17',
+    'bs_sponsor_advertisement_id' => '',
+    '_dp_original' => '42',
+);
+$api = new Broadstreet_Fake_Sponsor_Client();
+$reconciler = new Broadstreet_Sponsor_Reconciler($api, '99');
+$result = $reconciler->reconcile(43);
+broadstreet_assert_same('needs_action', $result['state'], 'A blank canonical original should require operator reconciliation.');
+broadstreet_assert_same('', $broadstreet_meta[43]['bs_sponsor_advertisement_id'], 'Fail-closed hydration must preserve blank draft tracker state.');
+broadstreet_assert_same(array(), $api->calls, 'Failed republish hydration must make zero vendor calls.');
+
+// A unique legacy tracker can be stamped in place; ambiguous legacy references
+// must stop rather than choosing an owner by title or URL.
+broadstreet_reset_sponsor_fixture();
+$broadstreet_meta[42] = array(
+    'bs_sponsor_is_sponsored' => '1',
+    'bs_sponsor_advertiser_id' => '17',
+    'bs_sponsor_advertisement_id' => '902',
+    Broadstreet_Sponsor_Reconciler::META_REMOTE_ADVERTISER => '17',
+);
+$api = new Broadstreet_Fake_Sponsor_Client();
+$reconciler = new Broadstreet_Sponsor_Reconciler($api, '99');
+$result = $reconciler->reconcile(42);
+broadstreet_assert_same('synced', $result['state'], 'A locally unique legacy tracker should be adopted and updated.');
+broadstreet_assert_same('42', $broadstreet_meta[42][Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST], 'Unique legacy adoption should persist the verified local owner.');
+
+broadstreet_reset_sponsor_fixture();
+$broadstreet_meta[42] = array(
+    'bs_sponsor_is_sponsored' => '1',
+    'bs_sponsor_advertiser_id' => '17',
+    'bs_sponsor_advertisement_id' => '902',
+);
+$broadstreet_meta[43] = $broadstreet_meta[42];
+$broadstreet_meta[43]['_dp_original'] = '42';
+$api = new Broadstreet_Fake_Sponsor_Client();
+$reconciler = new Broadstreet_Sponsor_Reconciler($api, '99');
+$result = $reconciler->reconcile(43);
+broadstreet_assert_same('synced', $result['state'], 'Legacy original-plus-republish references should be adopted as one canonical owner.');
+broadstreet_assert_same('42', $broadstreet_meta[43][Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST], 'Legacy republish adoption should stamp the original canonical owner.');
+
+broadstreet_reset_sponsor_fixture();
+$broadstreet_meta[42] = array(
+    'bs_sponsor_is_sponsored' => '1',
+    'bs_sponsor_advertiser_id' => '17',
+    'bs_sponsor_advertisement_id' => '902',
+);
+$broadstreet_meta[43] = $broadstreet_meta[42];
+$api = new Broadstreet_Fake_Sponsor_Client();
+$reconciler = new Broadstreet_Sponsor_Reconciler($api, '99');
+$result = $reconciler->reconcile(43);
+broadstreet_assert_same('needs_action', $result['state'], 'An ambiguous unstamped tracker should require operator reconciliation.');
+broadstreet_assert_same('', get_post_meta(43, Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST, true), 'Ambiguous legacy state must not be auto-adopted.');
+broadstreet_assert_same(array(), $api->calls, 'Ambiguous legacy state must not call the vendor API.');
+
+// If a newly returned tracker ID cannot be paired with its owner stamp, the
+// durable create journal must prevent a second remote create.
+broadstreet_reset_sponsor_fixture();
+$broadstreet_meta[42] = array(
+    'bs_sponsor_is_sponsored' => '1',
+    'bs_sponsor_advertiser_id' => '17',
+    'bs_sponsor_advertisement_id' => '',
+);
+$broadstreet_meta_failures[42][Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST] = true;
+$api = new Broadstreet_Fake_Sponsor_Client();
+$reconciler = new Broadstreet_Sponsor_Reconciler($api, '99');
+$first_result = $reconciler->reconcile(42);
+$calls_after_first_result = count($api->calls);
+$second_result = $reconciler->reconcile(42, true);
+broadstreet_assert_same('needs_action', $first_result['state'], 'A missing owner stamp after create should require operator reconciliation.');
+broadstreet_assert_same('needs_action', $second_result['state'], 'A missing owner stamp must remain blocked on explicit retry.');
+broadstreet_assert_same('7001', $broadstreet_meta[42]['bs_sponsor_advertisement_id'], 'A confirmed returned ID should remain available for operator recovery.');
+broadstreet_assert_same($calls_after_first_result, count($api->calls), 'Owner persistence failure must never dispatch a duplicate tracker create.');
 
 echo "Sponsor reconciler smoke test passed.\n";

@@ -44,3 +44,23 @@ as `node_modules`, `src`, `tests`, `scripts`, and `.github`.
 
 The generated zip is ignored by Git. Attach that verified artifact to a release;
 do not publish a working tree that contains development dependencies.
+
+## Sponsored tracker ownership
+
+Remote sponsored tracker IDs are server-owned state. Each ID is paired with a
+protected canonical WordPress owner-post ID before it may be updated. A Yoast
+Duplicate Post Rewrite & Republish draft uses its positive `_dp_original` value
+as that canonical identity, so it can keep the original public permalink and
+tracker. A normal duplicate is a separate owner and receives a guarded new
+tracker instead of updating the copied ID.
+
+The original and every Rewrite & Republish draft serialize reconciliation on
+that same canonical owner lock. A rewrite draft with blank local tracker state
+may hydrate only a tracker whose original-post ownership is proven locally; if
+the original has no provable tracker, synchronization stops in `needs_action`
+without creating a draft-specific tracker.
+
+Legacy tracker IDs are stamped in place only when an authoritative postmeta
+lookup finds the canonical post plus, optionally, drafts whose `_dp_original`
+all point to it. Ambiguous references stop in `needs_action`; they are never
+resolved from matching titles or URLs.

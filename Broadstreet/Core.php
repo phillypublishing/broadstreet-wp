@@ -541,12 +541,14 @@ class Broadstreet_Core
     public function registerSponsorMeta()
     {
         add_filter('is_protected_meta', array($this, 'protectSponsorServerMeta'), 10, 3);
-        add_filter(
-            'auth_post_meta_bs_sponsor_advertisement_id',
-            array($this, 'denySponsorAdvertisementMetaWrites'),
-            10,
-            6
-        );
+        foreach ($this->getSponsorServerMetaKeys() as $meta_key) {
+            add_filter(
+                'auth_post_meta_' . $meta_key,
+                array($this, 'denySponsorAdvertisementMetaWrites'),
+                10,
+                6
+            );
+        }
         add_filter('map_meta_cap', array($this, 'denySponsorAdvertisementMetaCaps'), 999, 4);
         add_action('wp_restore_post_revision', array($this, 'reconcileSponsorRevisionRestore'), 20, 2);
 
@@ -604,7 +606,7 @@ class Broadstreet_Core
 
     public function protectSponsorServerMeta($protected, $meta_key, $meta_type)
     {
-        if ($meta_type === 'post' && $meta_key === 'bs_sponsor_advertisement_id') {
+        if ($meta_type === 'post' && in_array($meta_key, $this->getSponsorServerMetaKeys(), true)) {
             return true;
         }
 
@@ -620,11 +622,19 @@ class Broadstreet_Core
     {
         if (in_array($cap, array('add_post_meta', 'edit_post_meta', 'delete_post_meta'), true)
             && isset($args[1])
-            && $args[1] === 'bs_sponsor_advertisement_id') {
+            && in_array($args[1], $this->getSponsorServerMetaKeys(), true)) {
             return array('do_not_allow');
         }
 
         return $caps;
+    }
+
+    protected function getSponsorServerMetaKeys()
+    {
+        return array(
+            'bs_sponsor_advertisement_id',
+            Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST,
+        );
     }
 
     public function reconcileSponsorRevisionRestore($post_id, $revision_id)

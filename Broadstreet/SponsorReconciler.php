@@ -18,6 +18,7 @@ class Broadstreet_Sponsor_Reconciler
     const LOCK_TTL = Broadstreet_Option_Lock::DEFAULT_TTL;
 
     const META_REMOTE_ADVERTISER = '_bs_sponsor_remote_advertiser_id';
+    const META_REMOTE_OWNER_POST = '_bs_sponsor_remote_owner_post_id';
     const META_FINGERPRINT = '_bs_sponsor_reconciliation_fingerprint';
     const META_STATUS = '_bs_sponsor_reconciliation_status';
     const META_CREATE_ATTEMPT = '_bs_sponsor_tracker_create_attempt';
@@ -27,6 +28,8 @@ class Broadstreet_Sponsor_Reconciler
     protected $network_id;
     protected $locks;
     protected $active_lock;
+    protected $active_lock_key;
+    protected $active_canonical_owner_post_id;
 
     public function __construct($client, $network_id)
     {
@@ -34,12 +37,14 @@ class Broadstreet_Sponsor_Reconciler
         $this->network_id = $network_id;
         $this->locks = new Broadstreet_Option_Lock();
         $this->active_lock = false;
+        $this->active_lock_key = '';
+        $this->active_canonical_owner_post_id = '';
     }
 
     /**
-     * Reconcile one canonical post. The lock is intentionally acquired before
-     * reading meta so an editor save that waited behind another request cannot
-     * act on stale values.
+     * Reconcile one post through its canonical owner lock. Canonical identity
+     * is sampled only to select the lock, then verified again after acquisition
+     * before any editorial or remote state is read.
      *
      * @param int  $post_id Post ID.
      * @param bool $explicit Whether a user explicitly requested a safe retry.
@@ -52,7 +57,9 @@ class Broadstreet_Sponsor_Reconciler
             return $this->status('error', 'Broadstreet could not identify the post to synchronize.', false);
         }
 
-        $lock = $this->acquireLock($post_id);
+        $canonical_owner_post_id = $this->getCanonicalOwnerPostId($post_id);
+        $lock_key = $this->getLockKey($canonical_owner_post_id);
+        $lock = $this->acquireLock($lock_key);
         if ($lock === false) {
             if (!$this->scheduleRetry($post_id)) {
                 return $this->recordStatus(
@@ -71,8 +78,28 @@ class Broadstreet_Sponsor_Reconciler
         }
 
         $this->active_lock = $lock;
+        $this->active_lock_key = $lock_key;
+        $this->active_canonical_owner_post_id = $canonical_owner_post_id;
 
         try {
+            if ($this->getCanonicalOwnerPostId($post_id) !== $canonical_owner_post_id) {
+                if (!$this->scheduleRetry($post_id)) {
+                    return $this->recordStatus(
+                        $post_id,
+                        'error',
+                        'Broadstreet synchronization could not be queued. Use Retry synchronization to try again.',
+                        true
+                    );
+                }
+
+                return $this->recordStatus(
+                    $post_id,
+                    'queued',
+                    'Broadstreet synchronization is queued because the canonical post changed during this save.',
+                    true
+                );
+            }
+
             $enabled = $this->isEnabled(
                 get_post_meta($post_id, 'bs_sponsor_is_sponsored', true)
             );
@@ -101,6 +128,49 @@ class Broadstreet_Sponsor_Reconciler
             }
 
             $desired = $this->readDesiredState($post_id, $advertiser_id);
+
+            if ($this->isRepublishDraft($post_id)
+                && !$this->isPositiveId($desired['advertisement_id'])) {
+                if (!$this->hydrateRepublishTracker($post_id, $canonical_owner_post_id)) {
+                    return $this->recordStatus(
+                        $post_id,
+                        'needs_action',
+                        'Broadstreet could not prove a tracker owned by the original post for this Rewrite & Republish draft. Check the original post and Broadstreet dashboard before taking further action.',
+                        false
+                    );
+                }
+
+                $desired = $this->readDesiredState($post_id, $advertiser_id);
+            }
+
+            $ownership = $this->resolveRemoteOwnership($post_id, $desired['advertisement_id']);
+            if ($ownership === 'ambiguous') {
+                return $this->recordStatus(
+                    $post_id,
+                    'needs_action',
+                    'Broadstreet could not prove which WordPress post owns this tracker. Check the Broadstreet dashboard before taking further action.',
+                    false
+                );
+            }
+            if ($ownership === 'foreign_republish_copy') {
+                return $this->recordStatus(
+                    $post_id,
+                    'needs_action',
+                    'This Rewrite & Republish draft references a tracker that is not owned by its original post. Check the Broadstreet dashboard before taking further action.',
+                    false
+                );
+            }
+            if ($ownership === 'copied') {
+                if (!$this->resetCopiedTrackerState($post_id)) {
+                    return $this->recordStatus(
+                        $post_id,
+                        'error',
+                        'Broadstreet could not safely separate this duplicate from the original tracker. Try again.',
+                        true
+                    );
+                }
+                $desired['advertisement_id'] = '';
+            }
 
             $fingerprint = $this->fingerprint($desired);
             $attempt = get_post_meta($post_id, self::META_CREATE_ATTEMPT, true);
@@ -150,8 +220,10 @@ class Broadstreet_Sponsor_Reconciler
 
             return $this->updateTracker($post_id, $desired, $fingerprint, $type);
         } finally {
-            $this->releaseLock($post_id, $lock);
+            $this->releaseLock($lock);
             $this->active_lock = false;
+            $this->active_lock_key = '';
+            $this->active_canonical_owner_post_id = '';
         }
     }
 
@@ -269,7 +341,7 @@ class Broadstreet_Sponsor_Reconciler
 
     protected function createTracker($post_id, $desired, $fingerprint, $type, $explicit = false)
     {
-        if (!$this->ownsActiveLock($post_id)) {
+        if (!$this->ownsActiveLock()) {
             return $this->recordStatus(
                 $post_id,
                 'queued',
@@ -291,6 +363,7 @@ class Broadstreet_Sponsor_Reconciler
         $attempt = array(
             'state' => 'dispatching',
             'fingerprint' => $fingerprint,
+            'owner_post_id' => $this->getOperationOwnerPostId($post_id),
             'created_at' => time(),
         );
         update_post_meta($post_id, self::META_CREATE_ATTEMPT, $attempt);
@@ -304,7 +377,7 @@ class Broadstreet_Sponsor_Reconciler
         }
 
 
-        if (!$this->ownsActiveLock($post_id)) {
+        if (!$this->ownsActiveLock()) {
             return $this->recordStatus(
                 $post_id,
                 'queued',
@@ -358,14 +431,13 @@ class Broadstreet_Sponsor_Reconciler
             );
         }
 
-        update_post_meta($post_id, 'bs_sponsor_advertisement_id', $advertisement_id);
-        if ((string) get_post_meta($post_id, 'bs_sponsor_advertisement_id', true) !== $advertisement_id) {
+        if (!$this->persistTrackerIdentity($post_id, $advertisement_id)) {
             $attempt['state'] = 'outcome_unknown';
             update_post_meta($post_id, self::META_CREATE_ATTEMPT, $attempt);
             return $this->recordStatus(
                 $post_id,
                 'needs_action',
-                'Broadstreet created a tracker, but WordPress could not safely store its ID. Check the Broadstreet dashboard before taking further action.',
+                'Broadstreet created a tracker, but WordPress could not safely store its ID and owner. Check the Broadstreet dashboard before taking further action.',
                 false
             );
         }
@@ -392,7 +464,7 @@ class Broadstreet_Sponsor_Reconciler
 
     protected function updateTracker($post_id, $desired, $fingerprint, $type)
     {
-        if (!$this->ownsActiveLock($post_id)) {
+        if (!$this->ownsActiveLock()) {
             return $this->recordStatus(
                 $post_id,
                 'queued',
@@ -440,6 +512,7 @@ class Broadstreet_Sponsor_Reconciler
                 'from_advertiser_id' => $remote_advertiser_id,
                 'to_advertiser_id' => $desired['advertiser_id'],
                 'fingerprint' => $fingerprint,
+                'owner_post_id' => $this->getOperationOwnerPostId($post_id),
                 'created_at' => time(),
             );
             update_post_meta($post_id, self::META_MOVE_ATTEMPT, $move_attempt);
@@ -454,7 +527,7 @@ class Broadstreet_Sponsor_Reconciler
         }
 
         try {
-            if (!$this->ownsActiveLock($post_id)) {
+            if (!$this->ownsActiveLock()) {
                 return $this->recordStatus(
                     $post_id,
                     'queued',
@@ -599,16 +672,23 @@ class Broadstreet_Sponsor_Reconciler
     protected function isExactAttemptPersisted($post_id, $meta_key, $expected)
     {
         $persisted = get_post_meta($post_id, $meta_key, true);
-        return is_array($persisted)
+        $matches = is_array($persisted)
             && isset($persisted['state'], $persisted['fingerprint'])
             && $persisted['state'] === $expected['state']
             && $persisted['fingerprint'] === $expected['fingerprint'];
+
+        if ($matches && isset($expected['owner_post_id'])) {
+            return isset($persisted['owner_post_id'])
+                && (string) $persisted['owner_post_id'] === (string) $expected['owner_post_id'];
+        }
+
+        return $matches;
     }
 
     protected function isExactMovePersisted($post_id, $expected)
     {
         $persisted = get_post_meta($post_id, self::META_MOVE_ATTEMPT, true);
-        foreach (array('state', 'advertisement_id', 'from_advertiser_id', 'to_advertiser_id', 'fingerprint') as $key) {
+        foreach (array('state', 'advertisement_id', 'from_advertiser_id', 'to_advertiser_id', 'fingerprint', 'owner_post_id') as $key) {
             if (!is_array($persisted)
                 || !isset($persisted[$key])
                 || (string) $persisted[$key] !== (string) $expected[$key]) {
@@ -621,6 +701,10 @@ class Broadstreet_Sponsor_Reconciler
 
     protected function persistPostUpdateState($post_id, $advertiser_id, $fingerprint)
     {
+        if (!$this->persistRemoteOwner($post_id)) {
+            return false;
+        }
+
         update_post_meta($post_id, self::META_REMOTE_ADVERTISER, $advertiser_id);
         if ((string) get_post_meta($post_id, self::META_REMOTE_ADVERTISER, true) !== (string) $advertiser_id) {
             return false;
@@ -628,6 +712,201 @@ class Broadstreet_Sponsor_Reconciler
 
         update_post_meta($post_id, self::META_FINGERPRINT, $fingerprint);
         return (string) get_post_meta($post_id, self::META_FINGERPRINT, true) === (string) $fingerprint;
+    }
+
+    protected function persistTrackerIdentity($post_id, $advertisement_id)
+    {
+        update_post_meta($post_id, 'bs_sponsor_advertisement_id', $advertisement_id);
+        if ((string) get_post_meta($post_id, 'bs_sponsor_advertisement_id', true) !== (string) $advertisement_id) {
+            return false;
+        }
+
+        return $this->persistRemoteOwner($post_id);
+    }
+
+    protected function persistRemoteOwner($post_id)
+    {
+        $canonical_owner_post_id = $this->getOperationOwnerPostId($post_id);
+        update_post_meta($post_id, self::META_REMOTE_OWNER_POST, $canonical_owner_post_id);
+        return (string) get_post_meta($post_id, self::META_REMOTE_OWNER_POST, true) === $canonical_owner_post_id;
+    }
+
+    /**
+     * Establish whether the current post may update a positive remote tracker.
+     * Legacy unstamped IDs are adopted only when the postmeta table proves that
+     * every local reference is the canonical post or its Rewrite & Republish
+     * draft.
+     */
+    protected function resolveRemoteOwnership($post_id, $advertisement_id)
+    {
+        if (!$this->isPositiveId($advertisement_id)) {
+            return 'owned';
+        }
+
+        $canonical_owner_post_id = $this->getCanonicalOwnerPostId($post_id);
+        $owner_post_id = (string) get_post_meta($post_id, self::META_REMOTE_OWNER_POST, true);
+        if ($this->isPositiveId($owner_post_id)) {
+            if ($canonical_owner_post_id === $owner_post_id) {
+                return 'owned';
+            }
+
+            return $this->isRepublishDraft($post_id) ? 'foreign_republish_copy' : 'copied';
+        }
+
+        $legacy_owner = $this->findLegacyCanonicalTrackerOwner(
+            $advertisement_id,
+            $canonical_owner_post_id
+        );
+        if ((string) $legacy_owner !== $canonical_owner_post_id) {
+            return 'ambiguous';
+        }
+
+        return $this->persistRemoteOwner($post_id) ? 'owned' : 'ambiguous';
+    }
+
+    protected function isRepublishDraft($post_id)
+    {
+        $original_post_id = get_post_meta($post_id, '_dp_original', true);
+        return $this->isPositiveId($original_post_id)
+            && (string) $original_post_id !== (string) $post_id;
+    }
+
+    protected function getCanonicalOwnerPostId($post_id)
+    {
+        $original_post_id = get_post_meta($post_id, '_dp_original', true);
+        if ($this->isPositiveId($original_post_id)) {
+            return (string) $original_post_id;
+        }
+
+        return (string) $post_id;
+    }
+
+    protected function getOperationOwnerPostId($post_id)
+    {
+        if ($this->isPositiveId($this->active_canonical_owner_post_id)) {
+            return (string) $this->active_canonical_owner_post_id;
+        }
+
+        return $this->getCanonicalOwnerPostId($post_id);
+    }
+
+    protected function findLegacyCanonicalTrackerOwner($advertisement_id, $canonical_owner_post_id)
+    {
+        global $wpdb;
+
+        if (!isset($wpdb)
+            || !isset($wpdb->postmeta)
+            || !method_exists($wpdb, 'prepare')
+            || !method_exists($wpdb, 'get_col')) {
+            return false;
+        }
+
+        $post_ids = $wpdb->get_col(
+            $wpdb->prepare(
+                "SELECT DISTINCT post_id FROM {$wpdb->postmeta} WHERE meta_key = %s AND meta_value = %s",
+                'bs_sponsor_advertisement_id',
+                (string) $advertisement_id
+            )
+        );
+
+        if (!is_array($post_ids) || !$post_ids) {
+            return false;
+        }
+
+        $found_canonical = false;
+        foreach (array_values(array_unique($post_ids)) as $referencing_post_id) {
+            if (!$this->isPositiveId($referencing_post_id)) {
+                return false;
+            }
+
+            if ((string) $referencing_post_id === (string) $canonical_owner_post_id) {
+                $found_canonical = true;
+                continue;
+            }
+
+            $original_post_id = get_post_meta($referencing_post_id, '_dp_original', true);
+            if (!$this->isPositiveId($original_post_id)
+                || (string) $original_post_id !== (string) $canonical_owner_post_id) {
+                return false;
+            }
+        }
+
+        return $found_canonical ? (string) $canonical_owner_post_id : false;
+    }
+
+    /**
+     * A foreign owner stamp proves the tracker state was copied. Clear only the
+     * duplicate's local remote state, journal first, so a crash can never leave
+     * an unjournaled create path.
+     */
+    protected function resetCopiedTrackerState($post_id)
+    {
+        $keys = array(
+            self::META_CREATE_ATTEMPT,
+            self::META_MOVE_ATTEMPT,
+            self::META_FINGERPRINT,
+            self::META_REMOTE_ADVERTISER,
+            'bs_sponsor_advertisement_id',
+            self::META_REMOTE_OWNER_POST,
+        );
+
+        foreach ($keys as $key) {
+            delete_post_meta($post_id, $key);
+        }
+
+        foreach ($keys as $key) {
+            if (get_post_meta($post_id, $key, true) !== '') {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Copy only proven canonical server state into a blank Rewrite & Republish
+     * draft. The advertisement ID is written last so a partial write cannot
+     * expose an unowned positive tracker to reconciliation.
+     */
+    protected function hydrateRepublishTracker($post_id, $canonical_owner_post_id)
+    {
+        $advertisement_id = (string) get_post_meta(
+            $canonical_owner_post_id,
+            'bs_sponsor_advertisement_id',
+            true
+        );
+        if (!$this->isPositiveId($advertisement_id)
+            || $this->resolveRemoteOwnership($canonical_owner_post_id, $advertisement_id) !== 'owned') {
+            return false;
+        }
+
+        $remote_advertiser_id = (string) get_post_meta(
+            $canonical_owner_post_id,
+            self::META_REMOTE_ADVERTISER,
+            true
+        );
+        if (!$this->isPositiveId($remote_advertiser_id)) {
+            $remote_advertiser_id = (string) get_post_meta(
+                $canonical_owner_post_id,
+                'bs_sponsor_advertiser_id',
+                true
+            );
+        }
+        if (!$this->isPositiveId($remote_advertiser_id)) {
+            return false;
+        }
+
+        if (!$this->persistRemoteOwner($post_id)) {
+            return false;
+        }
+
+        update_post_meta($post_id, self::META_REMOTE_ADVERTISER, $remote_advertiser_id);
+        if ((string) get_post_meta($post_id, self::META_REMOTE_ADVERTISER, true) !== $remote_advertiser_id) {
+            return false;
+        }
+
+        update_post_meta($post_id, 'bs_sponsor_advertisement_id', $advertisement_id);
+        return (string) get_post_meta($post_id, 'bs_sponsor_advertisement_id', true) === $advertisement_id;
     }
 
     protected function isPendingMoveAttempt($attempt, $advertisement_id)
@@ -772,20 +1051,28 @@ class Broadstreet_Sponsor_Reconciler
         return (string) get_post_meta($post_id, self::META_REMOTE_ADVERTISER, true) === (string) $advertiser_id;
     }
 
-    protected function acquireLock($post_id)
+    protected function getLockKey($canonical_owner_post_id)
     {
-        return $this->locks->acquire(self::LOCK_PREFIX . $post_id, self::LOCK_TTL);
+        return self::LOCK_PREFIX . $canonical_owner_post_id;
     }
 
-    protected function releaseLock($post_id, $lock)
+    protected function acquireLock($lock_key)
     {
-        $this->locks->release(self::LOCK_PREFIX . $post_id, $lock);
+        return $this->locks->acquire($lock_key, self::LOCK_TTL);
     }
 
-    protected function ownsActiveLock($post_id)
+    protected function releaseLock($lock)
+    {
+        if ($this->active_lock_key !== '') {
+            $this->locks->release($this->active_lock_key, $lock);
+        }
+    }
+
+    protected function ownsActiveLock()
     {
         return is_array($this->active_lock)
-            && $this->locks->owns(self::LOCK_PREFIX . $post_id, $this->active_lock);
+            && $this->active_lock_key !== ''
+            && $this->locks->owns($this->active_lock_key, $this->active_lock);
     }
 
     protected function scheduleRetry($post_id)
