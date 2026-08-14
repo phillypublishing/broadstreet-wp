@@ -442,7 +442,14 @@ class Broadstreet_Utility
         }
 
         $key = Broadstreet_Utility::getOption(Broadstreet_Core::KEY_API_KEY);
-        return new Broadstreet($key, $host, $secure);
+        $client = new Broadstreet($key, $host, $secure);
+
+        /**
+         * Filters the shared Broadstreet client used by legacy and utility code.
+         *
+         * @param Broadstreet $client Configured Broadstreet client.
+         */
+        return apply_filters('broadstreet_client', $client);
     }
 
     /**

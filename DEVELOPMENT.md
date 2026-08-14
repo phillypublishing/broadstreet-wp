@@ -33,6 +33,15 @@ CI runs `npm run check:build`, which rebuilds from the lockfile-backed toolchain
 and fails if `build/` is missing, untracked, or different from the committed
 output.
 
+## Shared client integration seam
+
+`Broadstreet_Utility::getBroadstreetClient()` applies the `broadstreet_client`
+filter to its configured client. The callback receives only that client object;
+raw API key, host, and transport settings are not separate filter arguments.
+Return an object implementing the Broadstreet client methods used by the calling
+feature. The narrower `broadstreet_sponsor_client` filter still takes precedence
+for sponsor operations and otherwise falls back through the shared seam.
+
 ## Release artifact
 
 Run `npm run check:package` to create and verify `broadstreet.zip`. The packager
