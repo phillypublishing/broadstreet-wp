@@ -18,6 +18,10 @@ require_once dirname(__FILE__) . '/Utility.php';
 require_once dirname(__FILE__) . '/View.php';
 require_once dirname(__FILE__) . '/Widget.php';
 require_once dirname(__FILE__) . '/Exception.php';
+require_once dirname(__FILE__) . '/OptionLock.php';
+require_once dirname(__FILE__) . '/SponsorReconciler.php';
+require_once dirname(__FILE__) . '/SponsorController.php';
+require_once dirname(__FILE__) . '/ZoneController.php';
 require_once dirname(__FILE__) . '/Vendor/Broadstreet.php';
 
 if (! class_exists('Broadstreet_Core')):
@@ -38,6 +42,10 @@ class Broadstreet_Core
     CONST BIZ_POST_TYPE           = 'bs_business';
     CONST BIZ_TAXONOMY            = 'business_category';
     CONST BIZ_SLUG                = 'businesses';
+    CONST META_ADVERTISER_CREATE_ATTEMPT = '_bs_sponsor_advertiser_create_attempt';
+
+    protected $sponsorController;
+    protected $zoneController;
 
     public static $_disableAds = false;
     public static $_rssCount = 0;
@@ -130,6 +138,19 @@ class Broadstreet_Core
     }
 
     /**
+     * Sponsor-only client seam for tests and integrations.
+     */
+    public function getSponsorBroadstreetClient()
+    {
+        $client = apply_filters('broadstreet_sponsor_client', null);
+        if (is_object($client)) {
+            return $client;
+        }
+
+        return $this->getBroadstreetClient();
+    }
+
+    /**
      * Register Wordpress hooks required for Broadstreet
      */
     private function _registerHooks()
@@ -139,7 +160,15 @@ class Broadstreet_Core
         # -- Below is core functionality --
         add_action('admin_menu', 	array($this, 'adminCallback'     ));
         add_action('admin_enqueue_scripts', array($this, 'adminStyles'));
+        add_action('enqueue_block_editor_assets', array($this, 'enqueueEditorAssets'));
+        add_action('init', array($this, 'registerSponsorMeta'), 20);
+        add_action('init', array($this, 'registerAdVisibilityMeta'), 20);
+        add_action('rest_api_init', array($this, 'registerSponsorRoutes'));
+        add_action('rest_api_init', array($this, 'registerZoneRoutes'));
+        add_action(Broadstreet_Sponsor_Reconciler::RETRY_HOOK, array($this, 'reconcileSponsorPost'));
+        add_filter('update_post_metadata', array($this, 'captureSponsorAdvertiserBeforeUpdate'), 10, 5);
         add_action('admin_init', 	array($this, 'adminInitCallback' ));        
+        add_action('wp', array($this, 'captureAdVisibilityState'));
         add_action('wp_enqueue_scripts',          array($this, 'addCDNScript' ));
         add_filter('script_loader_tag',          array($this, 'finalizeZoneTag' ));
         add_action('init',          array($this, 'businessIndexSidebar' ));
@@ -158,7 +187,7 @@ class Broadstreet_Core
 
         if (Broadstreet_Utility::getOption(self::KEY_API_KEY)) {
 			add_action('post_updated', array($this, 'saveSponsorPostMeta'), 20);
-			add_action('transition_post_status', array($this, 'monitorForScheduledPostStatus'), 20, 10, 3);
+			add_action('transition_post_status', array($this, 'monitorForScheduledPostStatus'), 99, 3);
         }
 
         add_action('post_updated', array($this, 'saveAdVisibilityMeta'), 20);
@@ -200,7 +229,6 @@ class Broadstreet_Core
         add_action('wp_ajax_import_facebook', array('Broadstreet_Ajax', 'importFacebook'));
         add_action('wp_ajax_register', array('Broadstreet_Ajax', 'register'));
         add_action('wp_ajax_save_zone_settings', array('Broadstreet_Ajax', 'saveZoneSettings'));
-        add_action('wp_ajax_get_sponsored_meta', array('Broadstreet_Ajax', 'getSponsorPostMeta'));
 
         add_action('rest_api_init', function () {
             # /wp-json/broadstreet/v1/targets
@@ -446,6 +474,340 @@ class Broadstreet_Core
     }
 
     /**
+     * Post types whose sponsor fields can participate in Gutenberg, REST,
+     * custom fields, and revisions.
+     *
+     * @return array Post type names.
+     */
+    public function getSponsorEditorPostTypes()
+    {
+        $post_types = get_post_types(array('show_in_rest' => true), 'objects');
+        $configured_post_types = apply_filters(
+            'broadstreet_meta_box_post_types',
+            get_post_types()
+        );
+        $eligible = array();
+
+        foreach ($post_types as $post_type => $post_type_object) {
+            $name = is_object($post_type_object) && isset($post_type_object->name)
+                ? $post_type_object->name
+                : $post_type;
+
+            if (in_array($name, $configured_post_types, true)
+                && post_type_supports($name, 'editor')
+                && post_type_supports($name, 'custom-fields')
+                && post_type_supports($name, 'revisions')
+                && function_exists('use_block_editor_for_post_type')
+                && use_block_editor_for_post_type($name)) {
+                $eligible[] = $name;
+            }
+        }
+
+        return $eligible;
+    }
+
+    /**
+     * Register the historical per-post ad visibility flag as shared,
+     * revisioned block-editor state.
+     */
+    public function registerAdVisibilityMeta()
+    {
+        foreach ($this->getSponsorEditorPostTypes() as $post_type) {
+            register_post_meta($post_type, 'bs_ads_disabled', array(
+                'type' => 'boolean',
+                'single' => true,
+                'default' => false,
+                'show_in_rest' => true,
+                'revisions_enabled' => true,
+                'sanitize_callback' => array($this, 'sanitizeAdVisibilityBoolean'),
+                'auth_callback' => array($this, 'authorizeAdVisibilityMeta'),
+            ));
+        }
+    }
+
+    public function sanitizeAdVisibilityBoolean($value)
+    {
+        return in_array($value, array(true, 1, '1', 'true'), true);
+    }
+
+    public function authorizeAdVisibilityMeta($allowed, $meta_key, $post_id)
+    {
+        return current_user_can('edit_post', (int) $post_id);
+    }
+
+    /**
+     * Register editor-owned sponsor fields as shared revisioned meta. The
+     * remote advertisement ID remains deliberately unregistered/server-owned.
+     */
+    public function registerSponsorMeta()
+    {
+        add_filter('is_protected_meta', array($this, 'protectSponsorServerMeta'), 10, 3);
+        foreach ($this->getSponsorServerMetaKeys() as $meta_key) {
+            add_filter(
+                'auth_post_meta_' . $meta_key,
+                array($this, 'denySponsorAdvertisementMetaWrites'),
+                10,
+                6
+            );
+        }
+        add_filter('map_meta_cap', array($this, 'denySponsorAdvertisementMetaCaps'), 999, 4);
+        add_action('wp_restore_post_revision', array($this, 'reconcileSponsorRevisionRestore'), 20, 2);
+
+        foreach ($this->getSponsorEditorPostTypes() as $post_type) {
+            register_post_meta($post_type, 'bs_sponsor_is_sponsored', array(
+                'type' => 'boolean',
+                'single' => true,
+                'default' => false,
+                'show_in_rest' => true,
+                'revisions_enabled' => true,
+                'sanitize_callback' => array($this, 'sanitizeSponsorBoolean'),
+                'auth_callback' => array($this, 'authorizeSponsorMeta'),
+            ));
+
+            register_post_meta($post_type, 'bs_sponsor_advertiser_id', array(
+                'type' => 'string',
+                'single' => true,
+                'default' => '',
+                'show_in_rest' => array(
+                    'schema' => array(
+                        'type' => 'string',
+                        'pattern' => '^(?:[1-9][0-9]*)?$',
+                    ),
+                ),
+                'revisions_enabled' => true,
+                'sanitize_callback' => array($this, 'sanitizeSponsorAdvertiserId'),
+                'auth_callback' => array($this, 'authorizeSponsorMeta'),
+            ));
+
+            // This hook runs after the REST controller has persisted meta.
+            add_action(
+                'rest_after_insert_' . $post_type,
+                array($this, 'reconcileSponsorRestPost'),
+                20,
+                3
+            );
+        }
+    }
+
+    public function sanitizeSponsorBoolean($value)
+    {
+        return in_array($value, array(true, 1, '1', 'true'), true);
+    }
+
+    public function sanitizeSponsorAdvertiserId($value)
+    {
+        $value = is_scalar($value) ? (string) $value : '';
+        return preg_match('/^[1-9][0-9]*$/D', $value) ? $value : '';
+    }
+
+    public function authorizeSponsorMeta($allowed, $meta_key, $post_id)
+    {
+        return current_user_can('edit_post', (int) $post_id);
+    }
+
+    public function protectSponsorServerMeta($protected, $meta_key, $meta_type)
+    {
+        if ($meta_type === 'post' && in_array($meta_key, $this->getSponsorServerMetaKeys(), true)) {
+            return true;
+        }
+
+        return $protected;
+    }
+
+    public function denySponsorAdvertisementMetaWrites($allowed, $meta_key, $post_id, $user_id, $cap, $caps)
+    {
+        return false;
+    }
+
+    public function denySponsorAdvertisementMetaCaps($caps, $cap, $user_id, $args)
+    {
+        if (in_array($cap, array('add_post_meta', 'edit_post_meta', 'delete_post_meta'), true)
+            && isset($args[1])
+            && in_array($args[1], $this->getSponsorServerMetaKeys(), true)) {
+            return array('do_not_allow');
+        }
+
+        return $caps;
+    }
+
+    protected function getSponsorServerMetaKeys()
+    {
+        return array(
+            'bs_sponsor_advertisement_id',
+            Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST,
+        );
+    }
+
+    public function reconcileSponsorRevisionRestore($post_id, $revision_id)
+    {
+        $this->queueSponsorPost((int) $post_id);
+    }
+
+    public function isSponsorEditorPostType($post_type)
+    {
+        return $post_type && in_array($post_type, $this->getSponsorEditorPostTypes(), true);
+    }
+
+    /**
+     * Preserve the advertiser that currently owns a remote tracker before the
+     * editor-owned advertiser field changes.
+     */
+    public function captureSponsorAdvertiserBeforeUpdate($check, $object_id, $meta_key, $meta_value, $prev_value)
+    {
+        if ($meta_key !== 'bs_sponsor_advertiser_id') {
+            return $check;
+        }
+
+        $old_advertiser_id = (string) get_post_meta($object_id, $meta_key, true);
+        if ($old_advertiser_id === (string) $meta_value
+            || $this->sanitizeSponsorAdvertiserId($old_advertiser_id) === '') {
+            return $check;
+        }
+
+        $advertisement_id = (string) get_post_meta($object_id, 'bs_sponsor_advertisement_id', true);
+        $remote_advertiser_id = (string) get_post_meta(
+            $object_id,
+            Broadstreet_Sponsor_Reconciler::META_REMOTE_ADVERTISER,
+            true
+        );
+
+        if ($this->sanitizeSponsorAdvertiserId($advertisement_id) !== ''
+            && $this->sanitizeSponsorAdvertiserId($remote_advertiser_id) === '') {
+            update_post_meta(
+                $object_id,
+                Broadstreet_Sponsor_Reconciler::META_REMOTE_ADVERTISER,
+                $old_advertiser_id
+            );
+        }
+
+        return $check;
+    }
+
+    /**
+     * Narrow authenticated resources used by the Gutenberg sponsor panel.
+     */
+    public function registerSponsorRoutes()
+    {
+        $this->getSponsorController()->registerRoutes();
+    }
+
+    /**
+     * Narrow authenticated zone catalog used only by post/page editors.
+     */
+    public function registerZoneRoutes()
+    {
+        $this->getZoneController()->registerRoutes();
+    }
+
+    public function canEditZonePost($request)
+    {
+        return $this->getZoneController()->canEditPost($request);
+    }
+
+    public function getEditorZones($request)
+    {
+        return $this->getZoneController()->getZones($request);
+    }
+
+    /**
+     * Zone-catalog seam for focused tests without replacing other clients.
+     */
+    public function getEditorZoneCache()
+    {
+        return Broadstreet_Utility::getZoneCache();
+    }
+
+    public function getZoneController()
+    {
+        if (!($this->zoneController instanceof Broadstreet_Zone_Controller)) {
+            $this->zoneController = new Broadstreet_Zone_Controller($this);
+        }
+
+        return $this->zoneController;
+    }
+
+    public function canEditSponsorPost($request)
+    {
+        return $this->getSponsorController()->canEditPost($request);
+    }
+
+    public function getSponsorAdvertisers($request)
+    {
+        return $this->getSponsorController()->getAdvertisers($request);
+    }
+
+    public function createSponsorAdvertiser($request)
+    {
+        return $this->getSponsorController()->createAdvertiser($request);
+    }
+
+    /**
+     * Execute one durable, guarded advertiser create for REST or Classic.
+     */
+    public function createSponsorAdvertiserForPost($post_id, $name)
+    {
+        return $this->getSponsorController()->createAdvertiserForPost($post_id, $name);
+    }
+
+    public function getSponsorStatus($request)
+    {
+        return $this->getSponsorController()->getStatus($request);
+    }
+
+    public function retrySponsorStatus($request)
+    {
+        return $this->getSponsorController()->retryStatus($request);
+    }
+
+    public function getSponsorController()
+    {
+        if (!($this->sponsorController instanceof Broadstreet_Sponsor_Controller)) {
+            $this->sponsorController = new Broadstreet_Sponsor_Controller($this);
+        }
+
+        return $this->sponsorController;
+    }
+
+    public function getSponsorReconciler()
+    {
+        return new Broadstreet_Sponsor_Reconciler(
+            $this->getSponsorBroadstreetClient(),
+            Broadstreet_Utility::getOption(self::KEY_NETWORK_ID)
+        );
+    }
+
+    public function reconcileSponsorPost($post_id)
+    {
+        if (Broadstreet_Utility::getOption(self::KEY_API_KEY)) {
+            return $this->getSponsorReconciler()->reconcile((int) $post_id);
+        }
+
+        return false;
+    }
+
+    public function queueSponsorPost($post_id)
+    {
+        return $this->getSponsorController()->queuePost($post_id);
+    }
+
+    public function reconcileSponsorRestPost($post, $request, $creating)
+    {
+        $post_id = isset($post->ID) ? (int) $post->ID : 0;
+        $route = is_object($request) && method_exists($request, 'get_route')
+            ? $request->get_route()
+            : '';
+
+        if (!$post_id
+            || wp_is_post_revision($post_id)
+            || wp_is_post_autosave($post_id)
+            || strpos($route, '/autosaves') !== false) {
+            return;
+        }
+
+        $this->queueSponsorPost($post_id);
+    }
+
+    /**
      * Handler for adding the Broadstreet business meta data boxes on the post
      * create/edit page
      */
@@ -455,14 +817,20 @@ class Broadstreet_Core
             'broadstreet_sectionid',
             __( 'Broadstreet Zone Info', 'broadstreet_textdomain' ),
             array($this, 'broadstreetInfoBox'),
-            'post'
+            'post',
+            'advanced',
+            'default',
+            array('__back_compat_meta_box' => true)
         );
 
         add_meta_box(
             'broadstreet_sectionid',
             __( 'Broadstreet Zone Info', 'broadstreet_textdomain'),
             array($this, 'broadstreetInfoBox'),
-            'page'
+            'page',
+            'advanced',
+            'default',
+            array('__back_compat_meta_box' => true)
         );
 
         /**
@@ -472,28 +840,37 @@ class Broadstreet_Core
          * @param array $post_types Array of post type slugs.
          */
         $screens = apply_filters('broadstreet_meta_box_post_types', get_post_types());
+        $editor_post_types = $this->getSponsorEditorPostTypes();
 
         if (Broadstreet_Utility::getOption(self::KEY_API_KEY)) {
             foreach ( $screens as $screen ) {
+                $callback_args = in_array($screen, $editor_post_types, true)
+                    ? array('__back_compat_meta_box' => true)
+                    : null;
                 add_meta_box(
                     'broadstreet_sposnor_sectionid',
                     __( '<span class="dashicons dashicons-performance"></span> Sponsored Content', 'broadstreet_textdomain'),
                     array($this, 'broadstreetSponsoredBox'),
                     $screen,
                     apply_filters('broadstreet_sponsored_meta_box_context', 'side', $screen),
-                    apply_filters('broadstreet_sponsored_meta_box_priority', 'high', $screen)
+                    apply_filters('broadstreet_sponsored_meta_box_priority', 'high', $screen),
+                    $callback_args
                 );
             }
         }
 
         foreach ( $screens as $screen ) {
+            $callback_args = in_array($screen, $editor_post_types, true)
+                ? array('__back_compat_meta_box' => true)
+                : null;
             add_meta_box(
                 'broadstreet_visibility_sectionid',
                 __( '<span class="dashicons dashicons-format-image"></span> Broadstreet Options', 'broadstreet_textdomain'),
                 array($this, 'broadstreetAdVisibilityBox'),
                 $screen,
                 apply_filters('broadstreet_options_meta_box_context', 'side', $screen),
-                apply_filters('broadstreet_options_meta_box_priority', 'default', $screen)
+                apply_filters('broadstreet_options_meta_box_priority', 'default', $screen),
+                $callback_args
             );
         }
 
@@ -524,6 +901,41 @@ class Broadstreet_Core
     }
 
     /**
+     * Load the compiled Broadstreet extension in the block editor.
+     *
+     * Dependencies and the cache-busting version are generated by the
+     * WordPress build toolchain. If a deployment is incomplete, fail closed
+     * rather than enqueueing a script with guessed metadata.
+     */
+    public function enqueueEditorAssets()
+    {
+        $plugin_root = dirname(dirname(__FILE__));
+        $script_path = $plugin_root . '/build/editor.js';
+        $asset_path = $plugin_root . '/build/editor.asset.php';
+
+        if (!file_exists($script_path) || !file_exists($asset_path)) {
+            return;
+        }
+
+        $asset = require $asset_path;
+
+        if (!is_array($asset)
+            || !isset($asset['dependencies'])
+            || !is_array($asset['dependencies'])
+            || !isset($asset['version'])) {
+            return;
+        }
+
+        wp_enqueue_script(
+            'broadstreet-editor',
+            plugins_url('build/editor.js', $plugin_root . '/broadstreet.php'),
+            $asset['dependencies'],
+            $asset['version'],
+            true
+        );
+    }
+
+    /**
      * Add powered-by notice
      */
     public function addPoweredBy()
@@ -544,10 +956,9 @@ class Broadstreet_Core
     {
         $code = '';
 
-        # while we're in the post, capture the disabled status of the ads
-        if (is_singular()) {
-            self::$_disableAds = Broadstreet_Utility::getPostMeta(get_queried_object_id(), 'bs_ads_disabled') == '1';
-        }
+        // Keep direct or unusually ordered calls robust while sharing the same
+        // state capture used before front-end content begins rendering.
+        $this->captureAdVisibilityState();
 
         $placement_settings = Broadstreet_Utility::getPlacementSettings();
         if (property_exists($placement_settings, 'use_old_tags') && $placement_settings->use_old_tags) {
@@ -566,6 +977,15 @@ class Broadstreet_Core
         }
 
         wp_add_inline_script('broadstreet-init', "$code", 'after');
+    }
+
+    /**
+     * Capture per-post ad visibility after WordPress has resolved the main query.
+     */
+    public function captureAdVisibilityState()
+    {
+        self::$_disableAds = is_singular()
+            && Broadstreet_Utility::getPostMeta(get_queried_object_id(), 'bs_ads_disabled') == '1';
     }
 
     /**
@@ -1093,7 +1513,7 @@ class Broadstreet_Core
         $advertiser_id    = Broadstreet_Utility::getPostMeta($post->ID, 'bs_sponsor_advertiser_id');
         $advertisement_id = Broadstreet_Utility::getPostMeta($post->ID, 'bs_sponsor_advertisement_id');
 
-        $api = $this->getBroadstreetClient();
+        $api = $this->getSponsorBroadstreetClient();
 
         try
         {
@@ -1111,7 +1531,8 @@ class Broadstreet_Core
         Broadstreet_View::load('admin/sponsoredBox', array(
             'meta'        => $meta,
             'advertisers' => $advertisers,
-            'network_id' => $network_id
+            'network_id' => $network_id,
+            'status' => $this->getSponsorReconciler()->getStatus($post->ID)
         ));
     }
 
@@ -1119,65 +1540,35 @@ class Broadstreet_Core
      * Allow user to enable and disable ads on a given page
      */
     public function saveAdVisibilityMeta($post_id) {
-        if(isset($_POST['bs_ads_disabled_submit'])) {
-            # save settings
-            foreach(self::$_visibilityDefaults as $key => $value)
-            {
-                if(isset($_POST[$key])) {
-                    Broadstreet_Utility::setPostMeta($post_id, $key, is_string($_POST[$key]) ? trim($_POST[$key]) : $_POST[$key]);
-                }
-            }
-
-            if (!isset($_POST['bs_ads_disabled'])) {
-                Broadstreet_Utility::setPostMeta($post_id, 'bs_ads_disabled', '');
-            }
+        if (!isset($_POST['bs_ads_disabled_submit'])
+            || wp_is_post_revision($post_id)
+            || wp_is_post_autosave($post_id)
+            || !isset($_POST['broadstreetadvisibility'])
+            || !wp_verify_nonce($_POST['broadstreetadvisibility'], plugin_basename(__FILE__))
+            || !current_user_can('edit_post', (int) $post_id)) {
+            return;
         }
+
+        $disabled = isset($_POST['bs_ads_disabled'])
+            && $this->sanitizeAdVisibilityBoolean($_POST['bs_ads_disabled']);
+
+        Broadstreet_Utility::setPostMeta($post_id, 'bs_ads_disabled', $disabled ? '1' : '');
     }
 
 	/**
-	 * Handler for saving sponsor-specific meta data for scheduled posts. Scheduled posts sometimes don't have the correct permalink
-	 * so this checks everytime a post's status is updated to `published` and executes an update to reflect the proper permalink in Broadstreet.
-	 * @param type $new_status The new status of the post
-	 * @param type $old_status The previous status of the post
-	 * @param type $post The post
+	 * Scheduled publication changes the canonical public URL. Reuse the same
+	 * locked reconciler so title, tracker type, 404, and failure behavior remain
+	 * identical to ordinary saves.
 	 */
-	public function monitorForScheduledPostStatus($new_status, $old_status, $post) {
-		if (($old_status != 'publish') && ($new_status == 'publish')) {
-			$meta = Broadstreet_Utility::getAllPostMeta($post->ID, self::$_businessDefaults);
-			
-			// Check if the keys exist in the meta array before accessing them
-			$ad_id = isset($meta['bs_sponsor_advertisement_id']) ? $meta['bs_sponsor_advertisement_id'] : null;
-			$advertiser_id = isset($meta['bs_sponsor_advertiser_id']) ? $meta['bs_sponsor_advertiser_id'] : null;
-			
-			if ($ad_id && $advertiser_id) {
-				$api = $this->getBroadstreetClient();
-				$network_id = Broadstreet_Utility::getOption(self::KEY_NETWORK_ID);
-				// Check if this post is a Yoast Republish
-				$original_post_id = get_post_meta($post->ID, '_dp_original', true);
-				$post_link = get_permalink($post->ID);
-
-                if ($original_post_id) {
-                    $post_link = get_permalink($original_post_id);
-                }
-
-                $params = array (
-					'stencil_inputs' => array('url' => $post_link),
-				);
-
-				try {
-					$api->updateAdvertisement($network_id, $advertiser_id, $ad_id, $params);
-				} catch (Broadstreet_ServerException $ex) {
-					if ($ex->code == 404) {
-						# ad was deleted on bsa side, reset the post
-						Broadstreet_Utility::setPostMeta($post->ID, 'bs_sponsor_is_sponsored', '');
-						Broadstreet_Utility::setPostMeta($post->ID, 'bs_sponsor_advertiser_id', '');
-						Broadstreet_Utility::setPostMeta($post->ID, 'bs_sponsor_advertisement_id', '');
-					}
-				} catch (\Exception $ex) {
-					// hopefully a temporary server error, do nothing
-				}
-			}
-		}
+	public function monitorForScheduledPostStatus($new_status, $old_status, $post)
+    {
+		if ($old_status !== 'publish'
+            && $new_status === 'publish'
+            && isset($post->ID)
+            && !wp_is_post_revision($post->ID)
+            && !wp_is_post_autosave($post->ID)) {
+	            $this->queueSponsorPost($post->ID);
+        }
 	}
 
     /**
@@ -1187,126 +1578,41 @@ class Broadstreet_Core
      */
     public function saveSponsorPostMeta($post_id, $content = false)
     {
-        if(isset($_POST['bs_sponsor_submit']))
-        {
-            # hold on to this in case it changes
-            $old_advertiser_id = $_POST['bs_sponsor_old_advertiser_id'];
-
-            # save settings
-            foreach(self::$_sponsoredDefaults as $key => $value)
-            {
-                if(isset($_POST[$key])) {
-                    Broadstreet_Utility::setPostMeta($post_id, $key, is_string($_POST[$key]) ? trim($_POST[$key]) : $_POST[$key]);
-                }
-            }
-
-            if (!isset($_POST['bs_sponsor_is_sponsored'])) {
-                /**
-                 * You can check-in any time you like, but you can never leave.
-                 * Trying to see if this fixes a client bug where this setting "turns off"
-                 * Maybe it's two editors conflicting?
-                 */
-                return;
-                # Broadstreet_Utility::setPostMeta($post_id, 'bs_sponsor_is_sponsored', '');
-            }
-
-            # Has an ad been created/set?
-            if (isset($_POST['bs_sponsor_is_sponsored'])) {
-
-                if(isset($_POST['bs_sponsor_advertiser_id']) && $_POST['bs_sponsor_advertiser_id'] !== '')
-                {
-                    # Okay, one is being set, but does it already exist?
-                    $ad_id = $_POST['bs_sponsor_advertisement_id'];
-                    $api   = $this->getBroadstreetClient();
-
-                    $network_id    = Broadstreet_Utility::getOption(self::KEY_NETWORK_ID);
-                    $advertiser_id = $_POST['bs_sponsor_advertiser_id'];
-
-                    $status = get_post_status($post_id);
-                    $post_link = get_the_permalink($post_id);
-
-                    // Since the permalink is not registered for unpublished posts, we simulate what it should be
-                    if (in_array($status, array("draft", "future", "pending"))) {
-                        $post_link = preg_replace('/\%postname\%/', get_sample_permalink($post_id)[1], get_sample_permalink($post_id)[0]);
-                    }
-
-                    // Check if this post is a Yoast Republish
-                    $original_post_id = get_post_meta($post_id, '_dp_original', true);
-                    if ($original_post_id) {
-                        $post_link = get_permalink($original_post_id);
-                    }
-
-                    # create the advertiser if it doesn't exist yet
-                    if ($advertiser_id == 'new_advertiser') {
-                        $advertiser_name = (isset($_POST['bs_sponsor_advertiser_name']) && $_POST['bs_sponsor_advertiser_name'])
-                                            ? str_pad(stripslashes($_POST['bs_sponsor_advertiser_name']), 3, '*')
-                                            : 'Untitled Advertiser';
-
-                        $advertiser = $api->createAdvertiser($network_id, $advertiser_name);
-                        $advertiser_id = $advertiser->id;
-                        # before it was set to "new_advertiser" so let's correct that
-                        Broadstreet_Utility::setPostMeta($post_id, 'bs_sponsor_advertiser_id', $advertiser_id);
-                    }
-
-                    if(!$ad_id)
-                    {
-                        $name          = substr(str_pad(get_the_title($post_id), 5, '*'), 0, 127);
-                        $type          = 'tracker';
-
-						// analytics_tracker if network has preference for sponsored_content_v3
-	                    $use_tracker_v3 = $api->getNetwork($network_id)->use_tracker_v3;
-	                    if ($use_tracker_v3) {
-							$type = 'analytics_tracker';
-	                    }
-
-                        try {
-                            $ad = $api->createAdvertisement($network_id, $advertiser_id, $name, $type, array(
-                                'stencil_inputs' => array('url' => $post_link),
-                                'post_id' => $post_id,
-                            ));
-
-                            Broadstreet_Utility::setPostMeta($post_id, 'bs_sponsor_advertisement_id', $ad->id);
-                            $ad_id = $ad->id;
-                        } catch (Broadstreet_ServerException $ex) {
-
-                        } catch (\Exception $ex) {
-                            // hopefully a temporary server error, do nothing
-                        }
-                    } else {
-                        $params = array (
-                            'name' => substr(str_pad(get_the_title($post_id), 5, '*'), 0, 127),
-                            'stencil_inputs' => array('url' => $post_link),
-                            'type' => 'tracker'
-                        );
-
-	                    # The case where they are using the new version of the sponsored content tracker
-	                    $use_tracker_v3 = $api->getNetwork($network_id)->use_tracker_v3;
-	                    if ($use_tracker_v3) {
-		                    $params['type'] = 'analytics_tracker';
-	                    }
-
-						# The case where the advertiser has switched on WP side
-                        if ($old_advertiser_id && $advertiser_id != $old_advertiser_id) {
-                            $params['new_advertiser_id'] = $advertiser_id;
-                            $advertiser_id = $old_advertiser_id;
-                        }
-
-                        try {
-                            $api->updateAdvertisement($network_id, $advertiser_id, $ad_id, $params);
-                        } catch (Broadstreet_ServerException $ex) {
-                            if ($ex->code == 404) {
-                                # ad was deleted on bsa side, reset the post
-                                Broadstreet_Utility::setPostMeta($post_id, 'bs_sponsor_is_sponsored', '');
-                                Broadstreet_Utility::setPostMeta($post_id, 'bs_sponsor_advertiser_id', '');
-                                Broadstreet_Utility::setPostMeta($post_id, 'bs_sponsor_advertisement_id', '');
-                            }
-                        } catch (\Exception $ex) {
-                            // hopefully a temporary server error, do nothing
-                        }
-                    }
-                }
-            }
+        if (!isset($_POST['bs_sponsor_submit'])
+            || wp_is_post_revision($post_id)
+            || wp_is_post_autosave($post_id)
+            || !current_user_can('edit_post', $post_id)
+            || !isset($_POST['broadstreetsponsored'])
+            || !wp_verify_nonce($_POST['broadstreetsponsored'], plugin_basename(__FILE__))) {
+            return;
         }
+
+        $enabled = isset($_POST['bs_sponsor_is_sponsored']);
+        Broadstreet_Utility::setPostMeta($post_id, 'bs_sponsor_is_sponsored', $enabled);
+
+        $advertiser_id = isset($_POST['bs_sponsor_advertiser_id'])
+            ? trim((string) $_POST['bs_sponsor_advertiser_id'])
+            : '';
+
+        if ($advertiser_id === 'new_advertiser') {
+            $advertiser_name = isset($_POST['bs_sponsor_advertiser_name'])
+                ? sanitize_text_field(stripslashes($_POST['bs_sponsor_advertiser_name']))
+                : '';
+            $advertiser_name = $advertiser_name
+                ? str_pad($advertiser_name, 3, '*')
+                : 'Untitled Advertiser';
+            $created = $this->createSponsorAdvertiserForPost($post_id, $advertiser_name);
+            if (is_wp_error($created)) {
+                return;
+            }
+            $advertiser_id = $created['id'];
+        }
+
+        if (preg_match('/^[1-9][0-9]*$/D', $advertiser_id)) {
+            Broadstreet_Utility::setPostMeta($post_id, 'bs_sponsor_advertiser_id', $advertiser_id);
+        }
+
+        $this->queueSponsorPost($post_id);
     }
 
 

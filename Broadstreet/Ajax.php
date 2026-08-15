@@ -118,27 +118,6 @@ class Broadstreet_Ajax
         die(json_encode(array('success' => true, 'advertiser' => $advertiser)));
     }
 
-    public static function getSponsorPostMeta() {
-        // Verify nonce and check user permissions
-        check_ajax_referer('broadstreet_ajax_nonce', 'nonce');
-
-        if (!current_user_can('edit_posts')) {
-            wp_die(json_encode(array('success' => false, 'message' => 'Unauthorized')));
-        }
-
-        $post_id = isset($_GET['post_id']) ? intval($_GET['post_id']) : 0;
-
-        // Verify user has permission to edit this post (fixes IDOR vulnerability)
-        if (!current_user_can('edit_post', $post_id)) {
-            die(json_encode(array('success' => false, 'error' => 'Permission denied')));
-        }
-
-        // Verify nonce and referer (fixes CSRF vulnerability)
-        check_ajax_referer('broadstreet_sponsor_nonce', '_wpnonce');
-
-        die(json_encode(array('success' => true, 'meta' => Broadstreet_Utility::getAllPostMeta($post_id))));
-    }
-
     public static function importFacebook()
     {
         // Verify nonce and check user permissions

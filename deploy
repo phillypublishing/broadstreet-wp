@@ -22,7 +22,18 @@ cd ../broadstreet-wp-svn/trunk
 SVN=`pwd`
 
 # Update the code
-rsync -avz --exclude=".*/" $GIT/* $SVN
+rsync -avz --delete --delete-excluded \
+  --exclude=".*/" \
+  --exclude="node_modules" \
+  --exclude="broadstreet.zip" \
+  --exclude="DEVELOPMENT.md" \
+  --exclude="package.json" \
+  --exclude="package-lock.json" \
+  --exclude="scripts" \
+  --exclude="src" \
+  --exclude="tests" \
+  --exclude="*.map" \
+  $GIT/ $SVN
 
 # Do some handywork
 rm deploy

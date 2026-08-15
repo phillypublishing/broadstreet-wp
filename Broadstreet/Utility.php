@@ -443,7 +443,14 @@ class Broadstreet_Utility
         }
 
         $key = Broadstreet_Utility::getOption(Broadstreet_Core::KEY_API_KEY);
-        return new Broadstreet($key, $host, $secure);
+        $client = new Broadstreet($key, $host, $secure);
+
+        /**
+         * Filters the shared Broadstreet client used by legacy and utility code.
+         *
+         * @param Broadstreet $client Configured Broadstreet client.
+         */
+        return apply_filters('broadstreet_client', $client);
     }
 
     /**
@@ -1229,15 +1236,6 @@ class Broadstreet_Utility
             $targets['pagetype'][] = 'is_home_page';
         } else {
             $targets['pagetype'][] = 'not_home_page';
-        }
-
-        if (is_user_logged_in()) {
-            $keywords[] = 'is_logged_in';
-            $user = wp_get_current_user();
-            $roles = ( array ) $user->roles;
-            foreach ($roles as $role) {
-                $keywords[] = $role;
-            }
         }
 
         # categories
