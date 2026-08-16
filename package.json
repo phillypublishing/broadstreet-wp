@@ -35,7 +35,8 @@
 		"@wordpress/plugins": "7.40.1",
 		"@wordpress/scripts": "31.5.1",
 		"adm-zip": "0.5.18",
-		"typescript": "5.9.3"
+		"typescript": "5.9.3",
+		"yaml": "1.10.3"
 	},
 	"scripts": {
 		"artifact:plugin": "node scripts/build-plugin-artifact.mjs",

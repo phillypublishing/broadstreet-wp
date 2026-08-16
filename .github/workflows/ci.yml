@@ -92,6 +92,9 @@ jobs:
       - name: Lint editor sources and package metadata
         run: npm run lint
 
+      - name: Check plugin release workflow contract
+        run: ./tests/plugin-release-workflow.test.sh
+
       - name: Run editor extension smoke tests
         run: npm test
 

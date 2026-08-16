@@ -6,6 +6,8 @@ import { fileURLToPath } from 'node:url';
 
 import AdmZip from 'adm-zip';
 
+import { readAlignedPluginVersion } from './plugin-version.mjs';
+
 const scriptDirectory = path.dirname( fileURLToPath( import.meta.url ) );
 const pluginRoot = path.dirname( scriptDirectory );
 const outputDirectory = path.resolve(
@@ -67,25 +69,7 @@ function main() {
 		throw new Error( 'The source commit timestamp must be an integer.' );
 	}
 
-	const packageMetadata = JSON.parse(
-		fs.readFileSync( path.join( pluginRoot, 'package.json' ), 'utf8' )
-	);
-	const pluginSource = fs.readFileSync(
-		path.join( pluginRoot, 'broadstreet.php' ),
-		'utf8'
-	);
-	const pluginVersion = pluginSource.match(
-		/^Version:\s*([^\s]+)\s*$/m
-	)?.[ 1 ];
-	if (
-		! pluginVersion ||
-		pluginVersion !== packageMetadata.version ||
-		! /^[A-Za-z0-9._+-]+$/.test( pluginVersion )
-	) {
-		throw new Error(
-			'The PHP and package.json versions must match and be filename-safe.'
-		);
-	}
+	const pluginVersion = readAlignedPluginVersion( pluginRoot );
 
 	run( 'npm', [ 'run', 'check:build' ], { stdio: 'inherit' } );
 	run( process.execPath, [ 'scripts/package-plugin.mjs' ], {

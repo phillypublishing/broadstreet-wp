@@ -1,0 +1,238 @@
+name: WordPress plugin release
+
+# A plugin Version header bump on master is the normal release signal. A
+# workflow_dispatch on master safely retries the same canonical version after a
+# failed run. Validation and artifact creation stay read-only; only the final,
+# needs-gated publisher receives contents:write.
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'broadstreet.php'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: broadstreet-plugin-release
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    if: github.ref == 'refs/heads/master'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      release: ${{ steps.version.outputs.release }}
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Detect canonical plugin Version change
+        id: version
+        env:
+          BEFORE_SHA: ${{ github.event.before || github.sha }}
+          CURRENT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          retry=()
+          if [[ "${EVENT_NAME}" == 'workflow_dispatch' ]]; then
+            retry=(--retry)
+          fi
+          node scripts/plugin-version.mjs gate \
+            --before "${BEFORE_SHA}" \
+            --current "${CURRENT_SHA}" \
+            --github-output "${GITHUB_OUTPUT}" \
+            "${retry[@]}"
+
+  php-smoke:
+    needs: detect
+    if: needs.detect.outputs.release == 'true'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['7.2', '7.4', '8.0', '8.1', '8.2', '8.3', '8.4']
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@bf6b4fbd49ca58e4608c9c89fba0b8d90bd2a39f # v2.35.5
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+          tools: none
+
+      - name: Check PHP syntax and runtime smokes
+        run: |
+          set -euo pipefail
+          find . -path ./.git -prune -o -type f -name '*.php' -print0 \
+            | xargs -0 -n1 php -l
+          for test_file in tests/php/*.php; do
+            php "${test_file}"
+          done
+
+  validate:
+    needs: detect
+    if: needs.detect.outputs.release == 'true'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install locked build dependencies
+        run: npm ci
+
+      - name: Check Node.js and npm versions
+        run: npm run check:engines
+
+      - name: Lint editor and release sources
+        run: npm run lint
+
+      - name: Check release workflow contract
+        run: ./tests/plugin-release-workflow.test.sh
+
+      - name: Run editor extension smoke tests
+        run: npm test
+
+      - name: Audit shipped production dependencies
+        run: npm audit --omit=dev --audit-level=low
+
+      - name: Set up PHP compatibility runtime
+        uses: shivammathur/setup-php@bf6b4fbd49ca58e4608c9c89fba0b8d90bd2a39f # v2.35.5
+        with:
+          php-version: '8.4'
+          coverage: none
+
+      - name: Install locked PHP compatibility tools
+        working-directory: .github
+        run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: Check PHP 7.2-8.4 compatibility
+        run: >
+          .github/vendor/bin/phpcs -p -n
+          --standard=.github/phpcs.xml.dist
+          broadstreet.php Broadstreet/
+
+  artifact:
+    needs: [detect, php-smoke, validate]
+    if: needs.detect.outputs.release == 'true'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install locked build dependencies
+        run: npm ci
+
+      - name: Build and verify release assets
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/plugin-release
+          BROADSTREET_ARTIFACT_ALLOW_DIRTY: 0
+        run: |
+          set -euo pipefail
+          node scripts/build-plugin-artifact.mjs "${ARTIFACT_DIR}"
+          node scripts/verify-plugin-artifact.mjs "${ARTIFACT_DIR}"
+
+      - name: Transfer verified release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: broadstreet-release-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/plugin-release/*.zip
+            ${{ runner.temp }}/plugin-release/*.sha256
+            ${{ runner.temp }}/plugin-release/plugin-artifact-manifest.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish:
+    needs: [detect, php-smoke, validate, artifact]
+    if: needs.detect.outputs.release == 'true'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout trusted release helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Download verified release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: broadstreet-release-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/plugin-release
+
+      - name: Re-verify transferred release assets
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/plugin-release
+        run: node scripts/verify-plugin-artifact.mjs "${ARTIFACT_DIR}"
+
+      - name: Publish or resume GitHub Release
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/plugin-release
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.detect.outputs.tag }}
+          PLUGIN_VERSION: ${{ needs.detect.outputs.version }}
+        run: |
+          node scripts/publish-plugin-release.mjs \
+            --artifact-dir "${ARTIFACT_DIR}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --sha "${GITHUB_SHA}" \
+            --tag "${RELEASE_TAG}" \
+            --version "${PLUGIN_VERSION}" \
+            --title "Broadstreet ${PLUGIN_VERSION}" \
+            --notes "Automated plugin release from master. Verify the ZIP with the attached SHA-256 checksum; the manifest records the exact source commit and packaged runtime files."
