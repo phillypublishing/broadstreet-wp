@@ -364,6 +364,15 @@ await runTest( 'workflow is structurally release-safe', () => {
 	const reverify = workflow.jobs.publish.steps.find(
 		( step ) => step.name === 'Re-verify transferred release assets'
 	);
+	const publishInstall = workflow.jobs.publish.steps.find(
+		( step ) => step.name === 'Install locked release helper dependencies'
+	);
+	assert.ok( publishInstall );
+	assert.equal( publishInstall.run, 'npm ci --ignore-scripts' );
+	assert.ok(
+		workflow.jobs.publish.steps.indexOf( publishInstall ) <
+			workflow.jobs.publish.steps.indexOf( reverify )
+	);
 	assert.equal( reverify.env.ARTIFACT_DIR, '${{ runner.temp }}/plugin-release' );
 	assert.match( reverify.run, /verify-plugin-artifact\.mjs/ );
 
