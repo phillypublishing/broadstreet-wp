@@ -4,6 +4,8 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
+import AdmZip from 'adm-zip';
+
 import { readAlignedPluginVersion } from './plugin-version.mjs';
 
 const scriptDirectory = path.dirname( fileURLToPath( import.meta.url ) );
@@ -48,6 +50,22 @@ function zipFiles( artifactPath ) {
 		.split( '\n' )
 		.filter( ( entry ) => entry && ! entry.endsWith( '/' ) )
 		.sort();
+}
+
+function assertZipPermissions( artifactPath ) {
+	for ( const entry of new AdmZip( artifactPath ).getEntries() ) {
+		const expectedMode = entry.isDirectory ? 0o755 : 0o644;
+		const actualMode = entry.header.fileAttr;
+		if ( actualMode !== expectedMode ) {
+			throw new Error(
+				`ZIP entry ${ entry.entryName } has mode ${ actualMode
+					.toString( 8 )
+					.padStart( 4, '0' ) }; expected ${ expectedMode
+					.toString( 8 )
+					.padStart( 4, '0' ) }.`
+			);
+		}
+	}
 }
 
 function assertEqual( field, actual, expected ) {
@@ -99,6 +117,7 @@ export function verifyPluginArtifact( outputDirectory ) {
 		.update( artifactBytes )
 		.digest( 'hex' );
 	const files = zipFiles( artifactPath );
+	assertZipPermissions( artifactPath );
 
 	assertEqual( 'schema', manifest.schema, 'broadstreet-plugin-artifact/v1' );
 	assertEqual( 'repository', manifest.repository, expectedRepository );

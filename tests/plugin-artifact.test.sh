@@ -177,7 +177,17 @@ node -e '
 	const verifyProvenance = process.argv[ 8 ] === "1";
 	const expectedArtifact = `broadstreet-${ expectedVersion }-${ expectedCommit.slice( 0, 12 ) }.zip`;
 	const expectedSha256 = crypto.createHash( "sha256" ).update( fs.readFileSync( zipPath ) ).digest( "hex" );
-	const files = new AdmZip( zipPath ).getEntries()
+	const entries = new AdmZip( zipPath ).getEntries();
+	for ( const entry of entries ) {
+		const expectedMode = entry.isDirectory ? 0o755 : 0o644;
+		const actualMode = entry.header.fileAttr;
+		if ( actualMode !== expectedMode ) {
+			throw new Error(
+				`ZIP entry ${ entry.entryName } has mode ${ actualMode.toString( 8 ).padStart( 4, "0" ) }; expected ${ expectedMode.toString( 8 ).padStart( 4, "0" ) }.`
+			);
+		}
+	}
+	const files = entries
 		.filter( ( entry ) => ! entry.isDirectory )
 		.map( ( entry ) => entry.entryName )
 		.sort();
@@ -237,6 +247,43 @@ if ! grep -Fq 'Artifact pluginVersion does not match the packaged source.' "${te
 	exit 1
 fi
 cp -p "${test_root}/plugin-artifact-manifest.json" "${manifest_path}"
+
+permission_guard_dir="${test_root}/permission-guard"
+mkdir -p "${permission_guard_dir}"
+cp -p "${artifact_path}" "${permission_guard_dir}/${artifact_name}"
+cp -p "${artifact_path}.sha256" "${permission_guard_dir}/${artifact_name}.sha256"
+cp -p "${manifest_path}" "${permission_guard_dir}/plugin-artifact-manifest.json"
+node -e '
+	const crypto = require( "node:crypto" );
+	const fs = require( "node:fs" );
+	const path = require( "node:path" );
+	const AdmZip = require( "adm-zip" );
+	const artifactPath = process.argv[ 1 ];
+	const checksumPath = `${ artifactPath }.sha256`;
+	const manifestPath = process.argv[ 2 ];
+	const zip = new AdmZip( artifactPath );
+	const directory = zip.getEntries().find( ( entry ) => entry.isDirectory );
+	if ( ! directory ) {
+		throw new Error( "Permission guard fixture requires a directory entry." );
+	}
+	directory.header.attr = 0x40000010;
+	zip.writeZip( artifactPath );
+	const sha256 = crypto.createHash( "sha256" ).update( fs.readFileSync( artifactPath ) ).digest( "hex" );
+	const manifest = JSON.parse( fs.readFileSync( manifestPath, "utf8" ) );
+	manifest.sha256 = sha256;
+	fs.writeFileSync( manifestPath, `${ JSON.stringify( manifest, null, 2 ) }\n` );
+	fs.writeFileSync( checksumPath, `${ sha256 }  ${ path.basename( artifactPath ) }\n` );
+' "${permission_guard_dir}/${artifact_name}" "${permission_guard_dir}/plugin-artifact-manifest.json"
+if node "${repo_root}/scripts/verify-plugin-artifact.mjs" "${permission_guard_dir}" \
+	> "${test_root}/permission-guard.log" 2>&1; then
+	echo 'Artifact verifier accepted a ZIP entry without Unix permissions.' >&2
+	exit 1
+fi
+if ! grep -Fq 'has mode 0000; expected 0755.' "${test_root}/permission-guard.log"; then
+	cat "${test_root}/permission-guard.log" >&2
+	echo 'Artifact verifier did not report the ZIP permission mismatch.' >&2
+	exit 1
+fi
 
 if [[ -e "${ignored_build_probe}" ]]; then
 	echo "Refusing to overwrite existing ignored-build probe: ${ignored_build_probe}" >&2

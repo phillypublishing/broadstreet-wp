@@ -108,7 +108,7 @@ for ( const relativePath of [ ...new Set( directories ) ].sort() ) {
 		'/'
 	) }/`;
 
-	zip.addFile( entryName, Buffer.alloc( 0 ), '', 0x41ed0000 );
+	zip.addFile( entryName, Buffer.alloc( 0 ), '', 0o755 );
 	normalizeEntry( entryName );
 }
 
@@ -122,7 +122,7 @@ for ( const relativePath of files.sort() ) {
 		entryName,
 		fs.readFileSync( path.join( pluginRoot, relativePath ) ),
 		'',
-		0x81a40000
+		0o644
 	);
 	normalizeEntry( entryName );
 }
