@@ -160,9 +160,7 @@ class Broadstreet_Core
         # -- Below is core functionality --
         add_action('admin_menu', 	array($this, 'adminCallback'     ));
         add_action('admin_enqueue_scripts', array($this, 'adminStyles'));
-        if (current_user_can('manage_options')) {
-            add_action('enqueue_block_editor_assets', array($this, 'enqueueEditorAssets'), 100);
-        }
+        add_action('enqueue_block_editor_assets', array($this, 'enqueueEditorAssets'), 100);
         add_action('init', array($this, 'registerSponsorMeta'), 20);
         add_action('init', array($this, 'registerAdVisibilityMeta'), 20);
         add_action('rest_api_init', array($this, 'registerSponsorRoutes'));
@@ -911,6 +909,10 @@ class Broadstreet_Core
      */
     public function enqueueEditorAssets()
     {
+        if (!current_user_can('manage_options')) {
+            return;
+        }
+
         $plugin_root = dirname(dirname(__FILE__));
         $script_path = $plugin_root . '/build/editor.js';
         $asset_path = $plugin_root . '/build/editor.asset.php';
