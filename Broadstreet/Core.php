@@ -18,8 +18,7 @@ require_once dirname(__FILE__) . '/Utility.php';
 require_once dirname(__FILE__) . '/View.php';
 require_once dirname(__FILE__) . '/Widget.php';
 require_once dirname(__FILE__) . '/Exception.php';
-require_once dirname(__FILE__) . '/OptionLock.php';
-require_once dirname(__FILE__) . '/SponsorReconciler.php';
+require_once dirname(__FILE__) . '/SponsorSync.php';
 require_once dirname(__FILE__) . '/SponsorController.php';
 require_once dirname(__FILE__) . '/ZoneController.php';
 require_once dirname(__FILE__) . '/Vendor/Broadstreet.php';
@@ -42,7 +41,6 @@ class Broadstreet_Core
     CONST BIZ_POST_TYPE           = 'bs_business';
     CONST BIZ_TAXONOMY            = 'business_category';
     CONST BIZ_SLUG                = 'businesses';
-    CONST META_ADVERTISER_CREATE_ATTEMPT = '_bs_sponsor_advertiser_create_attempt';
 
     protected $sponsorController;
     protected $zoneController;
@@ -165,8 +163,8 @@ class Broadstreet_Core
         add_action('init', array($this, 'registerAdVisibilityMeta'), 20);
         add_action('rest_api_init', array($this, 'registerSponsorRoutes'));
         add_action('rest_api_init', array($this, 'registerZoneRoutes'));
-        add_action(Broadstreet_Sponsor_Reconciler::RETRY_HOOK, array($this, 'reconcileSponsorPost'));
         add_filter('update_post_metadata', array($this, 'captureSponsorAdvertiserBeforeUpdate'), 10, 5);
+        add_filter('duplicate_post_excludelist_filter', array($this, 'excludeSponsorMetaFromDuplication'));
         add_action('admin_init', 	array($this, 'adminInitCallback' ));        
         add_action('wp', array($this, 'captureAdVisibilityState'));
         add_action('wp_enqueue_scripts',          array($this, 'addCDNScript' ));
@@ -536,8 +534,10 @@ class Broadstreet_Core
     }
 
     /**
-     * Register editor-owned sponsor fields as shared revisioned meta. The
-     * remote advertisement ID remains deliberately unregistered/server-owned.
+     * Register editor-owned sponsor fields as shared meta. The remote
+     * advertisement ID remains deliberately unregistered/server-owned, and
+     * sponsor fields are not revisioned: tracker linkage is server state, and
+     * restoring an old revision must not silently wipe or revert it.
      */
     public function registerSponsorMeta()
     {
@@ -551,7 +551,6 @@ class Broadstreet_Core
             );
         }
         add_filter('map_meta_cap', array($this, 'denySponsorAdvertisementMetaCaps'), 999, 4);
-        add_action('wp_restore_post_revision', array($this, 'reconcileSponsorRevisionRestore'), 20, 2);
 
         foreach ($this->getSponsorEditorPostTypes() as $post_type) {
             register_post_meta($post_type, 'bs_sponsor_is_sponsored', array(
@@ -559,7 +558,6 @@ class Broadstreet_Core
                 'single' => true,
                 'default' => false,
                 'show_in_rest' => true,
-                'revisions_enabled' => true,
                 'sanitize_callback' => array($this, 'sanitizeSponsorBoolean'),
                 'auth_callback' => array($this, 'authorizeSponsorMeta'),
             ));
@@ -574,7 +572,6 @@ class Broadstreet_Core
                         'pattern' => '^(?:[1-9][0-9]*)?$',
                     ),
                 ),
-                'revisions_enabled' => true,
                 'sanitize_callback' => array($this, 'sanitizeSponsorAdvertiserId'),
                 'auth_callback' => array($this, 'authorizeSponsorMeta'),
             ));
@@ -634,13 +631,26 @@ class Broadstreet_Core
     {
         return array(
             'bs_sponsor_advertisement_id',
-            Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST,
+            Broadstreet_Sponsor_Sync::META_REMOTE_ADVERTISER,
         );
     }
 
-    public function reconcileSponsorRevisionRestore($post_id, $revision_id)
+    /**
+     * Keep server-owned tracker state off Yoast Duplicate Post copies. A copy
+     * that inherited a tracker ID would update the original post's tracker;
+     * excluding these keys means a plain duplicate simply creates its own
+     * tracker on first save. The wildcard also covers sync status and any
+     * legacy reconciliation journal keys.
+     */
+    public function excludeSponsorMetaFromDuplication($meta_excludelist)
     {
-        $this->queueSponsorPost((int) $post_id);
+        return array_merge(
+            is_array($meta_excludelist) ? $meta_excludelist : array(),
+            array(
+                'bs_sponsor_advertisement_id',
+                '_bs_sponsor_*',
+            )
+        );
     }
 
     public function isSponsorEditorPostType($post_type)
@@ -667,7 +677,7 @@ class Broadstreet_Core
         $advertisement_id = (string) get_post_meta($object_id, 'bs_sponsor_advertisement_id', true);
         $remote_advertiser_id = (string) get_post_meta(
             $object_id,
-            Broadstreet_Sponsor_Reconciler::META_REMOTE_ADVERTISER,
+            Broadstreet_Sponsor_Sync::META_REMOTE_ADVERTISER,
             true
         );
 
@@ -675,7 +685,7 @@ class Broadstreet_Core
             && $this->sanitizeSponsorAdvertiserId($remote_advertiser_id) === '') {
             update_post_meta(
                 $object_id,
-                Broadstreet_Sponsor_Reconciler::META_REMOTE_ADVERTISER,
+                Broadstreet_Sponsor_Sync::META_REMOTE_ADVERTISER,
                 $old_advertiser_id
             );
         }
@@ -768,26 +778,17 @@ class Broadstreet_Core
         return $this->sponsorController;
     }
 
-    public function getSponsorReconciler()
+    public function getSponsorSync()
     {
-        return new Broadstreet_Sponsor_Reconciler(
+        return new Broadstreet_Sponsor_Sync(
             $this->getSponsorBroadstreetClient(),
             Broadstreet_Utility::getOption(self::KEY_NETWORK_ID)
         );
     }
 
-    public function reconcileSponsorPost($post_id)
+    public function syncSponsorPost($post_id)
     {
-        if (Broadstreet_Utility::getOption(self::KEY_API_KEY)) {
-            return $this->getSponsorReconciler()->reconcile((int) $post_id);
-        }
-
-        return false;
-    }
-
-    public function queueSponsorPost($post_id)
-    {
-        return $this->getSponsorController()->queuePost($post_id);
+        return $this->getSponsorController()->syncPost($post_id);
     }
 
     public function reconcileSponsorRestPost($post, $request, $creating)
@@ -804,7 +805,7 @@ class Broadstreet_Core
             return;
         }
 
-        $this->queueSponsorPost($post_id);
+        $this->syncSponsorPost($post_id);
     }
 
     /**
@@ -909,7 +910,7 @@ class Broadstreet_Core
      */
     public function enqueueEditorAssets()
     {
-        if (!current_user_can('manage_options')) {
+        if (!current_user_can('edit_posts')) {
             return;
         }
 
@@ -1536,7 +1537,7 @@ class Broadstreet_Core
             'meta'        => $meta,
             'advertisers' => $advertisers,
             'network_id' => $network_id,
-            'status' => $this->getSponsorReconciler()->getStatus($post->ID)
+            'status' => $this->getSponsorSync()->getStatus($post->ID)
         ));
     }
 
@@ -1560,9 +1561,10 @@ class Broadstreet_Core
     }
 
 	/**
-	 * Scheduled publication changes the canonical public URL. Reuse the same
-	 * locked reconciler so title, tracker type, 404, and failure behavior remain
-	 * identical to ordinary saves.
+	 * Publication changes the canonical public URL, and scheduled posts
+	 * publish through cron with no editor request at all. Block-editor and
+	 * Classic saves synchronize through their own later hooks with fresh meta,
+	 * so only other publish paths (cron, quick edit, programmatic) sync here.
 	 */
 	public function monitorForScheduledPostStatus($new_status, $old_status, $post)
     {
@@ -1570,8 +1572,10 @@ class Broadstreet_Core
             && $new_status === 'publish'
             && isset($post->ID)
             && !wp_is_post_revision($post->ID)
-            && !wp_is_post_autosave($post->ID)) {
-	            $this->queueSponsorPost($post->ID);
+            && !wp_is_post_autosave($post->ID)
+            && !(defined('REST_REQUEST') && REST_REQUEST)
+            && !isset($_POST['bs_sponsor_submit'])) {
+	            $this->syncSponsorPost($post->ID);
         }
 	}
 
@@ -1616,7 +1620,7 @@ class Broadstreet_Core
             Broadstreet_Utility::setPostMeta($post_id, 'bs_sponsor_advertiser_id', $advertiser_id);
         }
 
-        $this->queueSponsorPost($post_id);
+        $this->syncSponsorPost($post_id);
     }
 
 

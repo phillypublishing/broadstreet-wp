@@ -128,9 +128,9 @@ broadstreet_assert_same(
     'plugins_url() should resolve relative to the main plugin file.'
 );
 broadstreet_assert_same(
-    array('manage_options'),
+    array('edit_posts'),
     $broadstreet_capability_checks,
-    'The editor asset loader should require the administrator capability.'
+    'The editor asset loader should require post-editing capability.'
 );
 
 $broadstreet_current_user_can = false;
@@ -140,12 +140,12 @@ $core->enqueueEditorAssets();
 broadstreet_assert_same(
     0,
     count($broadstreet_enqueued_scripts),
-    'The editor script should not be enqueued for non-administrators.'
+    'The editor script should not be enqueued for users who cannot edit posts.'
 );
 broadstreet_assert_same(
-    array('manage_options', 'manage_options'),
+    array('edit_posts', 'edit_posts'),
     $broadstreet_capability_checks,
-    'The administrator capability should be checked when editor assets are enqueued.'
+    'The post-editing capability should be checked when editor assets are enqueued.'
 );
 
 echo "Editor asset smoke test passed.\n";

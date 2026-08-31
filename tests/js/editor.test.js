@@ -469,48 +469,6 @@ describe( 'Broadstreet sponsored-content editor extension', () => {
 			screen.getByRole( 'button', { name: 'Create advertiser' } )
 		).toBeEnabled();
 	} );
-
-	test( 'polls queued reconciliation status until cron work becomes visible', async () => {
-		jest.useFakeTimers();
-		let statusReads = 0;
-		apiFetch.mockImplementation( ( request ) => {
-			if ( request.path.startsWith( '/broadstreet/v1/advertisers' ) ) {
-				return Promise.resolve( [] );
-			}
-			statusReads += 1;
-			return Promise.resolve(
-				statusReads <= 2
-					? {
-							state: 'queued',
-							message: 'Queued',
-							retryable: false,
-							poll_after: 2,
-							updated_at: 100,
-					  }
-					: {
-							state: 'synced',
-							message: 'Visible after cron',
-							retryable: false,
-							updated_at: 101,
-					  }
-			);
-		} );
-		render( <BroadstreetSponsorPanel /> );
-		await screen.findByText( 'Queued' );
-
-		await act( async () => {
-			jest.advanceTimersByTime( 2000 );
-			await Promise.resolve();
-		} );
-		await screen.findByText( 'Queued' );
-		await act( async () => {
-			jest.advanceTimersByTime( 2000 );
-			await Promise.resolve();
-		} );
-		await screen.findByText( 'Visible after cron' );
-		expect( statusReads ).toBe( 3 );
-		jest.useRealTimers();
-	} );
 } );
 
 describe( 'Broadstreet Disable Ads editor extension', () => {

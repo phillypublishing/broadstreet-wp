@@ -62,41 +62,38 @@ Run `npm run artifact:plugin` to create the same version- and commit-addressed
 bundle under `dist/`. The builder refuses a dirty checkout by default. Do not
 publish a working tree that contains development dependencies.
 
-## Sponsored tracker ownership
+## Sponsored tracker synchronization
 
-Remote sponsored tracker IDs are server-owned state. Each ID is paired with a
-protected canonical WordPress owner-post ID before it may be updated. A Yoast
-Duplicate Post Rewrite & Republish draft uses its positive `_dp_original` value
-as that canonical identity, so it can keep the original public permalink and
-tracker. A normal duplicate is a separate owner and receives a guarded new
-tracker instead of updating the copied ID.
+Sponsorship is synchronized inline on save (`Broadstreet_Sponsor_Sync`): the
+first save of a sponsored post with an advertiser creates a tracker
+advertisement and stores its ID in the server-owned
+`bs_sponsor_advertisement_id` meta; later saves update the tracker's title and
+URL in place. `_bs_sponsor_remote_advertiser_id` records which advertiser the
+tracker currently lives under so an advertiser change is sent as a move
+addressed to the old advertiser. Both keys are protected and deniable through
+the generic meta APIs; only the plugin writes them.
 
-The original and every Rewrite & Republish draft serialize reconciliation on
-that same canonical owner lock. A rewrite draft with blank local tracker state
-may hydrate only a tracker whose original-post ownership is proven locally; if
-the original has no provable tracker, synchronization stops in `needs_action`
-without creating a draft-specific tracker.
+Duplicated posts stay safe by construction rather than by ownership proofs:
 
-Legacy tracker IDs are stamped in place only when an authoritative postmeta
-lookup finds the canonical post plus, optionally, drafts whose `_dp_original`
-all point to it. Ambiguous references stop in `needs_action`; they are never
-resolved from matching titles or URLs.
+- The `duplicate_post_excludelist_filter` hook excludes
+  `bs_sponsor_advertisement_id` and all `_bs_sponsor_*` keys from every Yoast
+  Duplicate Post copy, so no copy can inherit tracker state. A plain duplicate
+  that is marked sponsored simply creates its own tracker on first save.
+- A Rewrite & Republish draft (`_dp_is_rewrite_republish_copy`) never
+  synchronizes itself. Saving or republishing the draft re-synchronizes the
+  original post, which owns the tracker. A stale `_dp_original` alone (present
+  forever on every Yoast copy) does not mark a post as a republish draft.
 
-### Rare ambiguous Broadstreet requests
+If Broadstreet returns 404 for a stored tracker ID, automatic syncs report a
+retryable error and never abandon the ID; the explicit **Retry
+synchronization** action in the editor is the only path that replaces a
+missing tracker with a new one. A short transient guard prevents double
+tracker or advertiser creation from overlapping requests. If an API response
+is lost after a create succeeded, a retry can produce a duplicate tracker in
+the Broadstreet dashboard; that is rare, visible, and cheap to delete by hand,
+which is why the plugin no longer maintains write-ahead journals for it.
 
-Broadstreet does not document an idempotency key for tracker creation or a
-network-wide lookup by WordPress post ID. If a request may have succeeded but
-WordPress did not receive or persist the response, the reconciler reports
-`needs_action` instead of risking a duplicate remote tracker. This is a rare
-operator safeguard, not part of the normal publishing workflow.
-
-When it occurs, stop retrying the post and inspect the Broadstreet dashboard
-using the post title, URL, advertiser, and error time. Record the exact tracker
-and advertiser IDs if one tracker exists. If none or multiple exist, record that
-result rather than clearing Broadstreet's reconciliation metadata. The current
-plugin intentionally has no generic retry for an outcome-unknown create.
-
-Until a staging incident demonstrates the need for dedicated recovery tooling,
-dashboard inspection plus the
-[guarded-recovery backlog](https://github.com/phillypublishing/wp-realtime-poc/issues/22)
-is the recovery plan. Do not repair the state with ad-hoc post-meta edits.
+`scripts/cleanup-sponsor-meta.php` (run via `wp eval-file`, dry-run by
+default) removes reconciler-era locks, journals, and ownership stamps from
+older versions of this fork, and detaches tracker IDs that legacy duplication
+copied onto multiple posts.

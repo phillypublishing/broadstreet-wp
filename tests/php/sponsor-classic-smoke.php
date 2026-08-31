@@ -106,7 +106,7 @@ require_once $plugin_root . '/Broadstreet/Core.php';
 
 class Broadstreet_Test_Classic_Core extends Broadstreet_Core
 {
-    public function queueSponsorPost($post_id)
+    public function syncSponsorPost($post_id)
     {
         global $broadstreet_classic_reconciles;
         $broadstreet_classic_reconciles[] = $post_id;
@@ -140,7 +140,7 @@ $core->saveSponsorPostMeta(42);
 broadstreet_assert_same(false, $broadstreet_classic_meta[42]['bs_sponsor_is_sponsored'], 'Classic Editor should now store an explicit false when disabled.');
 broadstreet_assert_same('17', $broadstreet_classic_meta[42]['bs_sponsor_advertiser_id'], 'Classic disable should preserve the advertiser.');
 broadstreet_assert_same('901', $broadstreet_classic_meta[42]['bs_sponsor_advertisement_id'], 'Posted forms must not overwrite server-owned advertisement IDs.');
-broadstreet_assert_same(array(42), $broadstreet_classic_reconciles, 'Classic saves should use the shared reconciler.');
+broadstreet_assert_same(array(42), $broadstreet_classic_reconciles, 'Classic saves should use the shared synchronizer.');
 
 $_POST = array(
     'bs_sponsor_submit' => '1',
@@ -153,7 +153,7 @@ $core->saveSponsorPostMeta(42);
 broadstreet_assert_same(array(array(42, 'X**')), $broadstreet_classic_creates, 'Classic advertiser creation should remain an explicit form selection and retain the three-character bound.');
 broadstreet_assert_same('44', $broadstreet_classic_meta[42]['bs_sponsor_advertiser_id'], 'Classic creation should select the returned advertiser.');
 broadstreet_assert_same('901', $broadstreet_classic_meta[42]['bs_sponsor_advertisement_id'], 'Classic advertiser changes should preserve the remote tracker ID for a move.');
-broadstreet_assert_same(array(42, 42), $broadstreet_classic_reconciles, 'Classic creation should continue through the shared reconciler.');
+broadstreet_assert_same(array(42, 42), $broadstreet_classic_reconciles, 'Classic creation should continue through the shared synchronizer.');
 
 $before_invalid = $broadstreet_classic_meta[42];
 $_POST['broadstreetsponsored'] = 'invalid';

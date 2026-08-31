@@ -94,9 +94,8 @@ $broadstreet_post_types = array(42 => 'post', 43 => 'post', 44 => 'post', 45 => 
 $broadstreet_rest_meta = array();
 $broadstreet_rest_meta_failures = array();
 $broadstreet_rest_options = array();
+$broadstreet_rest_transients = array();
 $broadstreet_injected_client = null;
-$broadstreet_rest_scheduled = array();
-$broadstreet_schedule_failure = false;
 
 class Broadstreet_Test_REST_DB
 {
@@ -216,24 +215,23 @@ function maybe_unserialize($value)
     return $unserialized === false && $value !== serialize(false) ? $value : $unserialized;
 }
 
-function wp_next_scheduled($hook, $args = array())
+function get_transient($key)
 {
-    global $broadstreet_rest_scheduled;
-    foreach ($broadstreet_rest_scheduled as $event) {
-        if ($event['hook'] === $hook && $event['args'] === $args) {
-            return $event['time'];
-        }
-    }
-    return false;
+    global $broadstreet_rest_transients;
+    return isset($broadstreet_rest_transients[$key]) ? $broadstreet_rest_transients[$key] : false;
 }
 
-function wp_schedule_single_event($time, $hook, $args = array())
+function set_transient($key, $value, $ttl = 0)
 {
-    global $broadstreet_rest_scheduled, $broadstreet_schedule_failure;
-    if ($broadstreet_schedule_failure) {
-        return false;
-    }
-    $broadstreet_rest_scheduled[] = array('time' => $time, 'hook' => $hook, 'args' => $args);
+    global $broadstreet_rest_transients;
+    $broadstreet_rest_transients[$key] = $value;
+    return true;
+}
+
+function delete_transient($key)
+{
+    global $broadstreet_rest_transients;
+    unset($broadstreet_rest_transients[$key]);
     return true;
 }
 
@@ -288,6 +286,12 @@ function get_post_meta($post_id, $key, $single = false)
 {
     global $broadstreet_rest_meta;
     return isset($broadstreet_rest_meta[$post_id][$key]) ? $broadstreet_rest_meta[$post_id][$key] : '';
+}
+
+function metadata_exists($meta_type, $post_id, $key)
+{
+    global $broadstreet_rest_meta;
+    return isset($broadstreet_rest_meta[$post_id][$key]);
 }
 
 function update_post_meta($post_id, $key, $value)
@@ -349,22 +353,9 @@ class Broadstreet_Fake_REST_Client
     }
 }
 
-class Broadstreet_Fake_REST_Reconciler
+class Broadstreet_Fake_REST_Sync
 {
-    public $retry_calls = array();
-    public $recorded_statuses = array();
-
-    public function recordStatus($post_id, $state, $message, $retryable)
-    {
-        $status = array(
-            'state' => $state,
-            'message' => $message,
-            'retryable' => $retryable,
-            'updated_at' => 122,
-        );
-        $this->recorded_statuses[] = array($post_id, $status);
-        return $status;
-    }
+    public $sync_calls = array();
 
     public function getStatus($post_id)
     {
@@ -377,9 +368,9 @@ class Broadstreet_Fake_REST_Reconciler
         );
     }
 
-    public function reconcile($post_id, $explicit = false)
+    public function sync($post_id, $explicit = false)
     {
-        $this->retry_calls[] = array($post_id, $explicit);
+        $this->sync_calls[] = array($post_id, $explicit);
         return array(
             'state' => 'synced',
             'message' => 'Broadstreet tracking is synchronized.',
@@ -387,6 +378,15 @@ class Broadstreet_Fake_REST_Reconciler
             'updated_at' => 124,
             'private_debug' => 'access_token=secret',
         );
+    }
+
+    public function getRewriteRepublishOriginal($post_id)
+    {
+        if (get_post_meta($post_id, '_dp_is_rewrite_republish_copy', true) === '1') {
+            return (int) get_post_meta($post_id, '_dp_original', true);
+        }
+
+        return 0;
     }
 }
 
@@ -411,23 +411,23 @@ $broadstreet_injected_client = null;
 class Broadstreet_Test_REST_Core extends Broadstreet_Core
 {
     public $fake_client;
-    public $fake_reconciler;
+    public $fake_sync;
 
     public function getBroadstreetClient()
     {
         return $this->fake_client;
     }
 
-    public function getSponsorReconciler()
+    public function getSponsorSync()
     {
-        return $this->fake_reconciler;
+        return $this->fake_sync;
     }
 }
 
 $reflection = new ReflectionClass('Broadstreet_Test_REST_Core');
 $core = $reflection->newInstanceWithoutConstructor();
 $core->fake_client = new Broadstreet_Fake_REST_Client();
-$core->fake_reconciler = new Broadstreet_Fake_REST_Reconciler();
+$core->fake_sync = new Broadstreet_Fake_REST_Sync();
 $core->registerSponsorRoutes();
 
 broadstreet_assert_same(
@@ -478,22 +478,10 @@ $failed_create = $core->createSponsorAdvertiser(new Broadstreet_Test_REST_Reques
 broadstreet_assert_same(true, is_wp_error($failed_create), 'Vendor creation failures should become REST errors.');
 broadstreet_assert_same(false, strpos($failed_create->get_error_message(), 'raw-secret'), 'REST errors must not include raw vendor failures.');
 broadstreet_assert_same(
-    true,
-    stripos($failed_create->get_error_message(), 'check the Broadstreet dashboard') !== false,
-    'Ambiguous creation failures should give credential-free recovery guidance.'
+    false,
+    isset($broadstreet_rest_transients['bs_advertiser_creating_42']),
+    'The create guard should be released after a failure so the user can retry.'
 );
-$create_call_count = count($core->fake_client->create_calls);
-$failed_create_again = $core->createSponsorAdvertiser(new Broadstreet_Test_REST_Request(array('post_id' => 42, 'name' => 'Uncertain Sponsor')));
-broadstreet_assert_same(true, is_wp_error($failed_create_again), 'Repeating an outcome-unknown request should remain blocked.');
-broadstreet_assert_same($create_call_count, count($core->fake_client->create_calls), 'An outcome-unknown advertiser must never be created automatically again.');
-$failed_changed_name = $core->createSponsorAdvertiser(new Broadstreet_Test_REST_Request(array('post_id' => 42, 'name' => 'Different Sponsor')));
-broadstreet_assert_same(true, is_wp_error($failed_changed_name), 'Changing the advertiser fingerprint must not bypass an outcome-unknown create.');
-broadstreet_assert_same($create_call_count, count($core->fake_client->create_calls), 'Outcome-unknown advertiser state should be global to the post.');
-
-$broadstreet_rest_meta_failures[43][Broadstreet_Core::META_ADVERTISER_CREATE_ATTEMPT] = true;
-$failed_marker = $core->createSponsorAdvertiser(new Broadstreet_Test_REST_Request(array('post_id' => 43, 'name' => 'Persist First')));
-broadstreet_assert_same('broadstreet_advertiser_state_persistence_failed', $failed_marker->get_error_code(), 'Advertiser creation should fail closed when its dispatch marker is not readable.');
-broadstreet_assert_same($create_call_count, count($core->fake_client->create_calls), 'A failed pre-dispatch marker must abort before the vendor create call.');
 
 $core->fake_client->create_exception = null;
 $unicode_create = $core->createSponsorAdvertiser(new Broadstreet_Test_REST_Request(array('post_id' => 44, 'name' => '猫猫猫')));
@@ -503,21 +491,19 @@ $create_call_count = count($core->fake_client->create_calls);
 $core->fake_client->create_exception = new Broadstreet_ServerException('invalid', '', 422);
 $rejected_create = $core->createSponsorAdvertiser(new Broadstreet_Test_REST_Request(array('post_id' => 45, 'name' => 'Retry Sponsor')));
 $calls_after_rejection = count($core->fake_client->create_calls);
-broadstreet_assert_same('broadstreet_advertiser_rejected', $rejected_create->get_error_code(), 'A definite advertiser 422 should be distinguished from an ambiguous outcome.');
+broadstreet_assert_same('broadstreet_advertiser_rejected', $rejected_create->get_error_code(), 'A definite advertiser 422 should be distinguished from other failures.');
 $core->fake_client->create_exception = null;
 $retried_create = $core->createSponsorAdvertiser(new Broadstreet_Test_REST_Request(array('post_id' => 45, 'name' => 'Retry Sponsor')));
 broadstreet_assert_same(false, is_wp_error($retried_create), 'An explicit advertiser-create action may retry a definite 422.');
 broadstreet_assert_same($calls_after_rejection + 1, count($core->fake_client->create_calls), 'The definite advertiser failure should dispatch exactly one explicit retry.');
 $create_call_count = count($core->fake_client->create_calls);
 
-$broadstreet_rest_options['_broadstreet_sponsor_advertiser_create_lock_42'] = maybe_serialize(array(
-    'token' => 'other-request',
-    'created_at' => time(),
-));
+$broadstreet_rest_transients['bs_advertiser_creating_42'] = 1;
 $contended_create = $core->createSponsorAdvertiser(new Broadstreet_Test_REST_Request(array('post_id' => 42, 'name' => 'Another Sponsor')));
-broadstreet_assert_same(true, is_wp_error($contended_create), 'Concurrent advertiser creation should stop at the per-post lock.');
-broadstreet_assert_same($create_call_count, count($core->fake_client->create_calls), 'Lock contention must not dispatch a second create POST.');
-unset($broadstreet_rest_options['_broadstreet_sponsor_advertiser_create_lock_42']);
+broadstreet_assert_same(true, is_wp_error($contended_create), 'Concurrent advertiser creation should stop at the per-post guard.');
+broadstreet_assert_same('broadstreet_advertiser_create_in_progress', $contended_create->get_error_code(), 'Guarded creation should return the in-progress error code.');
+broadstreet_assert_same($create_call_count, count($core->fake_client->create_calls), 'Guard contention must not dispatch a second create POST.');
+unset($broadstreet_rest_transients['bs_advertiser_creating_42']);
 
 $status_response = $core->getSponsorStatus($allowed_request);
 $status = $status_response->get_data();
@@ -527,7 +513,6 @@ broadstreet_assert_same(
         'message' => 'Broadstreet could not update the tracker. Save or retry to try again.',
         'retryable' => true,
         'updated_at' => 123,
-        'poll_after' => 0,
     ),
     $status,
     'Status responses should use a fixed public allowlist.'
@@ -535,35 +520,37 @@ broadstreet_assert_same(
 broadstreet_assert_same('no-store, private', $status_response->headers['Cache-Control'], 'Status responses should not be cached.');
 
 $retried = $core->retrySponsorStatus($allowed_request)->get_data();
-broadstreet_assert_same('synced', $retried['state'], 'Explicit status POST should retry reconciliation.');
-broadstreet_assert_same(array(array(42, true)), $core->fake_reconciler->retry_calls, 'REST retry must be marked explicit.');
+broadstreet_assert_same('synced', $retried['state'], 'Explicit status POST should synchronize immediately.');
+broadstreet_assert_same(array(array(42, true)), $core->fake_sync->sync_calls, 'REST retry must be marked explicit.');
 broadstreet_assert_same(false, strpos(json_encode($retried), 'secret'), 'Retry responses must retain the status allowlist.');
+$core->fake_sync->sync_calls = array();
 
+// A post that has never touched sponsorship is left completely alone.
+$untouched = $core->syncSponsorPost(43);
+broadstreet_assert_same(false, $untouched, 'Untouched posts should not synchronize.');
+broadstreet_assert_same(array(), $core->fake_sync->sync_calls, 'Untouched posts must not reach the synchronizer.');
+
+// A post with sponsor meta synchronizes inline on save.
 $broadstreet_rest_meta[42] = array(
-    'bs_sponsor_is_sponsored' => '',
+    'bs_sponsor_is_sponsored' => '1',
     'bs_sponsor_advertiser_id' => '20',
 );
-$queued_disabled = $core->queueSponsorPost(42);
-broadstreet_assert_same('disabled', $queued_disabled['state'], 'Disabled posts should receive a fixed synchronous status.');
-broadstreet_assert_same(array(), $broadstreet_rest_scheduled, 'Disabled posts must not enqueue vendor work.');
+$synced = $core->syncSponsorPost(42);
+broadstreet_assert_same('synced', $synced['state'], 'Sponsored posts should synchronize inline.');
+broadstreet_assert_same(array(array(42, false)), $core->fake_sync->sync_calls, 'Ordinary saves are not explicit retries.');
+$core->fake_sync->sync_calls = array();
 
-$broadstreet_rest_meta[42]['bs_sponsor_is_sponsored'] = '1';
-$broadstreet_rest_meta[42]['bs_sponsor_advertiser_id'] = '';
-$queued_waiting = $core->queueSponsorPost(42);
-broadstreet_assert_same('waiting', $queued_waiting['state'], 'Advertiser-missing posts should receive a fixed synchronous status.');
-broadstreet_assert_same(array(), $broadstreet_rest_scheduled, 'Advertiser-missing posts must not enqueue vendor work.');
-
-$broadstreet_rest_meta[42]['bs_sponsor_advertiser_id'] = '20';
-$queued = $core->queueSponsorPost(42);
-$queued_again = $core->queueSponsorPost(42);
-broadstreet_assert_same('queued', $queued['state'], 'Eligible ordinary reconciliation should return a fixed queued status.');
-broadstreet_assert_same('queued', $queued_again['state'], 'Repeated ordinary reconciliation should remain queued.');
-broadstreet_assert_same(1, count($broadstreet_rest_scheduled), 'Ordinary reconciliation events should be deduplicated per post.');
-
-$broadstreet_rest_scheduled = array();
-$broadstreet_schedule_failure = true;
-$queue_failure = $core->queueSponsorPost(42);
-broadstreet_assert_same('error', $queue_failure['state'], 'Cron scheduling failure should be surfaced explicitly.');
-broadstreet_assert_same(true, $queue_failure['retryable'], 'Scheduling failure should expose the direct Retry action.');
+// Saving a Rewrite & Republish draft keeps the original's tracker current.
+$broadstreet_rest_meta[44] = array(
+    '_dp_is_rewrite_republish_copy' => '1',
+    '_dp_original' => '42',
+    'bs_sponsor_is_sponsored' => '1',
+);
+$core->syncSponsorPost(44);
+broadstreet_assert_same(
+    array(array(44, false), array(42, false)),
+    $core->fake_sync->sync_calls,
+    'A Rewrite & Republish draft save should record its own status and synchronize the original.'
+);
 
 echo "Sponsor REST smoke test passed.\n";

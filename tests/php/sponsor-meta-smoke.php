@@ -214,7 +214,7 @@ broadstreet_assert_same(
 );
 foreach (array(
     'bs_sponsor_advertisement_id',
-    Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST,
+    Broadstreet_Sponsor_Sync::META_REMOTE_ADVERTISER,
 ) as $server_meta_key) {
     broadstreet_assert_same(
         true,
@@ -232,11 +232,22 @@ foreach (array(
         'Every server-owned sponsor key should deny capability-mapped writes.'
     );
 }
-update_post_meta(42, Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST, '42');
+update_post_meta(42, Broadstreet_Sponsor_Sync::META_REMOTE_ADVERTISER, '55');
 broadstreet_assert_same(
-    '42',
-    get_post_meta(42, Broadstreet_Sponsor_Reconciler::META_REMOTE_OWNER_POST, true),
-    'Internal reconciliation should still be able to persist remote-owner stamps.'
+    '55',
+    get_post_meta(42, Broadstreet_Sponsor_Sync::META_REMOTE_ADVERTISER, true),
+    'Internal synchronization should still be able to persist remote-advertiser stamps.'
+);
+
+broadstreet_assert_same(
+    array('_edit_lock', 'bs_sponsor_advertisement_id', '_bs_sponsor_*'),
+    $core->excludeSponsorMetaFromDuplication(array('_edit_lock')),
+    'Yoast Duplicate Post copies must never inherit server-owned tracker or sync state.'
+);
+broadstreet_assert_same(
+    array('bs_sponsor_advertisement_id', '_bs_sponsor_*'),
+    $core->excludeSponsorMetaFromDuplication(null),
+    'The duplication excludelist filter should tolerate a non-array input.'
 );
 
 broadstreet_assert_same(
@@ -267,11 +278,19 @@ foreach (array('post', 'page', 'story') as $post_type) {
     broadstreet_assert_same('boolean', $registered['bs_sponsor_is_sponsored']['type'], 'The sponsorship toggle should be boolean.');
     broadstreet_assert_true($registered['bs_sponsor_is_sponsored']['single'], 'The sponsorship toggle should be single meta.');
     broadstreet_assert_true($registered['bs_sponsor_is_sponsored']['show_in_rest'], 'The sponsorship toggle should be REST-visible.');
-    broadstreet_assert_true($registered['bs_sponsor_is_sponsored']['revisions_enabled'], 'The sponsorship toggle should be revisioned.');
+    broadstreet_assert_same(
+        false,
+        isset($registered['bs_sponsor_is_sponsored']['revisions_enabled']),
+        'The sponsorship toggle must not be revisioned; restoring an old revision must not wipe it.'
+    );
 
     broadstreet_assert_same('string', $registered['bs_sponsor_advertiser_id']['type'], 'Advertiser IDs should stay opaque strings.');
     broadstreet_assert_true($registered['bs_sponsor_advertiser_id']['single'], 'Advertiser IDs should be single meta.');
-    broadstreet_assert_true($registered['bs_sponsor_advertiser_id']['revisions_enabled'], 'Advertiser IDs should be revisioned.');
+    broadstreet_assert_same(
+        false,
+        isset($registered['bs_sponsor_advertiser_id']['revisions_enabled']),
+        'Advertiser IDs must not be revisioned; restoring an old revision must not wipe them.'
+    );
     broadstreet_assert_same(
         '^(?:[1-9][0-9]*)?$',
         $registered['bs_sponsor_advertiser_id']['show_in_rest']['schema']['pattern'],
@@ -342,11 +361,11 @@ class Broadstreet_Test_Sponsor_Request
 
 class Broadstreet_Test_Sponsor_Core extends Broadstreet_Core
 {
-    public $queued = array();
+    public $synced = array();
 
-    public function queueSponsorPost($post_id)
+    public function syncSponsorPost($post_id)
     {
-        $this->queued[] = array(
+        $this->synced[] = array(
             $post_id,
             get_post_meta($post_id, 'bs_sponsor_advertiser_id', true),
         );
@@ -355,27 +374,11 @@ class Broadstreet_Test_Sponsor_Core extends Broadstreet_Core
 
 $test_reflection = new ReflectionClass('Broadstreet_Test_Sponsor_Core');
 $test_core = $test_reflection->newInstanceWithoutConstructor();
-$test_core->queued = array();
+$test_core->synced = array();
 $test_core->reconcileSponsorRestPost((object) array('ID' => 100), new Broadstreet_Test_Sponsor_Request('/wp/v2/posts/100'), false);
 $test_core->reconcileSponsorRestPost((object) array('ID' => 101), new Broadstreet_Test_Sponsor_Request('/wp/v2/posts/101'), false);
 $test_core->reconcileSponsorRestPost((object) array('ID' => 42), new Broadstreet_Test_Sponsor_Request('/wp/v2/posts/42/autosaves'), false);
 $test_core->reconcileSponsorRestPost((object) array('ID' => 42), new Broadstreet_Test_Sponsor_Request('/wp/v2/posts/42'), false);
-broadstreet_assert_same(array(array(42, '')), $test_core->queued, 'REST saves should queue work while revisions and autosaves remain side-effect free.');
-
-$restore_hooks = array_values(array_filter($broadstreet_actions, function ($action) {
-    return $action[0] === 'wp_restore_post_revision';
-}));
-broadstreet_assert_same(1, count($restore_hooks), 'Revision restore reconciliation should be registered once.');
-broadstreet_assert_same(20, $restore_hooks[0][2], 'Sponsor reconciliation must run after core restores revisioned meta at priority 10.');
-broadstreet_assert_same(2, $restore_hooks[0][3], 'Revision restore reconciliation should receive the post and revision IDs.');
-
-// Accurate hook simulation: core's priority-10 callback has already copied meta.
-$broadstreet_meta[42]['bs_sponsor_advertiser_id'] = '77';
-$test_core->reconcileSponsorRevisionRestore(42, 100);
-broadstreet_assert_same(
-    array(array(42, ''), array(42, '77')),
-    $test_core->queued,
-    'The post-restore callback should observe restored sponsor meta and queue reconciliation.'
-);
+broadstreet_assert_same(array(array(42, '')), $test_core->synced, 'REST saves should synchronize while revisions and autosaves remain side-effect free.');
 
 echo "Sponsor meta registration smoke test passed.\n";
