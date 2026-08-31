@@ -95,16 +95,36 @@ Duplicated posts stay safe by construction rather than by ownership proofs:
 - The draft's editor panel reads and retries the original post's sync status:
   the status REST routes resolve an R&R draft to its `_dp_original`.
 
-If Broadstreet returns 404 for a stored tracker ID, automatic syncs report a
-retryable error and never abandon the ID; the explicit **Retry
-synchronization** action in the editor is the only path that replaces a
-missing tracker with a new one. A short transient guard prevents double
-tracker or advertiser creation from overlapping requests. If an API response
-is lost after a create succeeded, a retry can produce a duplicate tracker in
-the Broadstreet dashboard; that is rare, visible, and cheap to delete by hand,
-which is why the plugin no longer maintains write-ahead journals for it.
+A stored fingerprint of (advertiser, title, URL) short-circuits saves that
+change nothing sponsor-relevant, so content-only saves of a synced post make
+no Broadstreet HTTP calls at all; explicit retries always re-sync.
 
-`scripts/cleanup-sponsor-meta.php` (run via `wp eval-file`, dry-run by
-default) removes reconciler-era locks, journals, and ownership stamps from
-older versions of this fork, and detaches tracker IDs that legacy duplication
-copied onto multiple posts.
+If Broadstreet returns 404 for a stored tracker ID, an advertiser move in
+flight is first retried once addressed to the intended advertiser (a lost
+move response strands the old stamp while the tracker already moved).
+Otherwise automatic syncs report a retryable error and never abandon the ID;
+the explicit **Retry synchronization** action in the editor is the only path
+that replaces a missing tracker with a new one. A short transient guard
+narrows — but, being check-then-set, does not eliminate — the window for
+double tracker or advertiser creation from overlapping requests. If an API
+response is lost after a create succeeded, a retry can produce a duplicate
+tracker in the Broadstreet dashboard; that is rare, visible, and cheap to
+delete by hand, which is why the plugin no longer maintains write-ahead
+journals or atomic locks for it.
+
+Managing sponsorship (the panel, the sponsor REST routes, and sponsor meta
+writes) requires the capability from the `broadstreet_sponsor_manage_capability`
+filter — `edit_others_posts` by default, i.e. Editors and Administrators —
+because trackers and advertisers are billable objects in the Broadstreet
+account. Zone info and per-post ad visibility remain available to anyone who
+can edit posts. Duplication protection is Yoast-specific: other duplication
+tooling (imports, other clone plugins) should exclude `bs_sponsor_*` and
+`_bs_sponsor_*` meta itself, or the copy's first save will update the
+original's tracker.
+
+A one-time, version-gated migration (`Broadstreet_Core::maybeMigrateSponsorData`,
+on `admin_init`) clears reconciler-era cron events, journals, statuses, and
+locks, and detaches tracker IDs that legacy duplication copied onto multiple
+posts (the oldest post keeps the tracker). `scripts/cleanup-sponsor-meta.php`
+(run via `wp eval-file`, dry-run by default) remains for inspecting what the
+migration would do, or re-running it manually.

@@ -38,6 +38,7 @@ class Broadstreet_Core
     CONST KEY_INSTALL_REPORT      = 'Broadstreet_Installed';
     CONST KEY_SHOW_OFFERS         = 'Broadstreet_Offers';
     CONST KEY_PLACEMENTS          = 'Broadstreet_Placements';
+    CONST KEY_SPONSOR_MIGRATION   = 'Broadstreet_Sponsor_Sync_Migration';
     CONST BIZ_POST_TYPE           = 'bs_business';
     CONST BIZ_TAXONOMY            = 'business_category';
     CONST BIZ_SLUG                = 'businesses';
@@ -164,9 +165,11 @@ class Broadstreet_Core
         add_action('rest_api_init', array($this, 'registerSponsorRoutes'));
         add_action('rest_api_init', array($this, 'registerZoneRoutes'));
         add_filter('update_post_metadata', array($this, 'captureSponsorAdvertiserBeforeUpdate'), 10, 5);
+        add_filter('delete_post_metadata', array($this, 'captureSponsorAdvertiserBeforeDelete'), 10, 5);
         add_filter('duplicate_post_excludelist_filter', array($this, 'excludeSponsorMetaFromDuplication'));
         add_action('duplicate_post_before_republish', array($this, 'purgeSponsorMetaBeforeRepublish'), 10, 2);
         add_action('duplicate_post_after_republish', array($this, 'syncSponsorAfterRepublish'), 10, 2);
+        add_action('admin_init', array($this, 'maybeMigrateSponsorData'), 5);
         add_action('admin_init', 	array($this, 'adminInitCallback' ));        
         add_action('wp', array($this, 'captureAdVisibilityState'));
         add_action('wp_enqueue_scripts',          array($this, 'addCDNScript' ));
@@ -599,9 +602,21 @@ class Broadstreet_Core
         return preg_match('/^[1-9][0-9]*$/D', $value) ? $value : '';
     }
 
+    /**
+     * Capability required to manage sponsored-content tracking: the editor
+     * panel, the sponsor REST routes, and sponsor meta writes. Defaults to
+     * Editors and Administrators; sponsorship spends money in the Broadstreet
+     * account, so Authors and Contributors are excluded by default.
+     */
+    public function getSponsorManageCapability()
+    {
+        return apply_filters('broadstreet_sponsor_manage_capability', 'edit_others_posts');
+    }
+
     public function authorizeSponsorMeta($allowed, $meta_key, $post_id)
     {
-        return current_user_can('edit_post', (int) $post_id);
+        return current_user_can('edit_post', (int) $post_id)
+            && current_user_can($this->getSponsorManageCapability());
     }
 
     public function protectSponsorServerMeta($protected, $meta_key, $meta_type)
@@ -705,9 +720,36 @@ class Broadstreet_Core
         }
 
         $old_advertiser_id = (string) get_post_meta($object_id, $meta_key, true);
-        if ($old_advertiser_id === (string) $meta_value
-            || $this->sanitizeSponsorAdvertiserId($old_advertiser_id) === '') {
+        if ($old_advertiser_id !== (string) $meta_value) {
+            $this->maybeStampRemoteAdvertiser($object_id, $old_advertiser_id);
+        }
+
+        return $check;
+    }
+
+    /**
+     * Yoast's republish replaces meta with delete + add (filters off), so an
+     * advertiser change applied that way never passes through the update
+     * filter above. Capture the outgoing value before the delete instead.
+     */
+    public function captureSponsorAdvertiserBeforeDelete($check, $object_id, $meta_key, $meta_value, $delete_all)
+    {
+        if ($meta_key !== 'bs_sponsor_advertiser_id') {
             return $check;
+        }
+
+        $this->maybeStampRemoteAdvertiser(
+            $object_id,
+            (string) get_post_meta($object_id, $meta_key, true)
+        );
+
+        return $check;
+    }
+
+    protected function maybeStampRemoteAdvertiser($object_id, $old_advertiser_id)
+    {
+        if ($this->sanitizeSponsorAdvertiserId($old_advertiser_id) === '') {
+            return;
         }
 
         $advertisement_id = (string) get_post_meta($object_id, 'bs_sponsor_advertisement_id', true);
@@ -725,8 +767,74 @@ class Broadstreet_Core
                 $old_advertiser_id
             );
         }
+    }
 
-        return $check;
+    /**
+     * One-time upgrade from the reconciler era: clear its orphaned cron
+     * events, journals, stamps, statuses, and locks, and detach tracker IDs
+     * that legacy duplication copied onto multiple posts (the oldest post
+     * keeps the tracker). Without the detach step, an ownership-free sync of
+     * a legacy duplicate would rewrite the original post's live tracker.
+     * scripts/cleanup-sponsor-meta.php remains for manual dry runs.
+     */
+    public function maybeMigrateSponsorData()
+    {
+        if (get_option(self::KEY_SPONSOR_MIGRATION) === '1') {
+            return;
+        }
+
+        global $wpdb;
+        if (!isset($wpdb) || !isset($wpdb->postmeta) || !function_exists('delete_post_meta_by_key')) {
+            return;
+        }
+
+        if (function_exists('wp_unschedule_hook')) {
+            wp_unschedule_hook('broadstreet_reconcile_sponsor_post');
+        }
+
+        foreach (array(
+            '_bs_sponsor_tracker_create_attempt',
+            '_bs_sponsor_tracker_move_attempt',
+            '_bs_sponsor_reconciliation_fingerprint',
+            '_bs_sponsor_reconciliation_status',
+            '_bs_sponsor_remote_owner_post_id',
+            '_bs_sponsor_advertiser_create_attempt',
+        ) as $meta_key) {
+            delete_post_meta_by_key($meta_key);
+        }
+
+        foreach (array(
+            '_broadstreet_sponsor_lock_',
+            '_broadstreet_sponsor_advertiser_create_lock_',
+        ) as $lock_prefix) {
+            $wpdb->query($wpdb->prepare(
+                "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s",
+                $wpdb->esc_like($lock_prefix) . '%'
+            ));
+        }
+
+        $shared = $wpdb->get_col(
+            "SELECT meta_value FROM {$wpdb->postmeta}
+             WHERE meta_key = 'bs_sponsor_advertisement_id'
+               AND meta_value REGEXP '^[1-9][0-9]*$'
+             GROUP BY meta_value HAVING COUNT(DISTINCT post_id) > 1"
+        );
+        foreach (is_array($shared) ? $shared : array() as $advertisement_id) {
+            $post_ids = $wpdb->get_col($wpdb->prepare(
+                "SELECT DISTINCT pm.post_id FROM {$wpdb->postmeta} pm
+                 JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+                 WHERE pm.meta_key = 'bs_sponsor_advertisement_id' AND pm.meta_value = %s
+                 ORDER BY p.post_date ASC, p.ID ASC",
+                (string) $advertisement_id
+            ));
+            array_shift($post_ids);
+            foreach ($post_ids as $post_id) {
+                delete_post_meta($post_id, 'bs_sponsor_advertisement_id');
+                delete_post_meta($post_id, Broadstreet_Sponsor_Sync::META_REMOTE_ADVERTISER);
+            }
+        }
+
+        update_option(self::KEY_SPONSOR_MIGRATION, '1', false);
     }
 
     /**
@@ -973,6 +1081,17 @@ class Broadstreet_Core
             $asset['dependencies'],
             $asset['version'],
             true
+        );
+
+        // Zone info and ad visibility are available to anyone who can edit
+        // posts; managing sponsorship (which spends Broadstreet budget) is
+        // gated separately, and the panel hides itself when denied.
+        wp_add_inline_script(
+            'broadstreet-editor',
+            'window.broadstreetEditor = ' . wp_json_encode(array(
+                'canManageSponsorship' => current_user_can($this->getSponsorManageCapability()),
+            )) . ';',
+            'before'
         );
     }
 
@@ -1598,9 +1717,11 @@ class Broadstreet_Core
 
 	/**
 	 * Publication changes the canonical public URL, and scheduled posts
-	 * publish through cron with no editor request at all. Block-editor and
-	 * Classic saves synchronize through their own later hooks with fresh meta,
-	 * so only other publish paths (cron, quick edit, programmatic) sync here.
+	 * publish through cron with no editor request at all. Classic saves
+	 * synchronize through their own later handler with fresh meta. REST
+	 * publishes are deferred to shutdown: this hook fires before the REST
+	 * controller has persisted meta, and custom REST routes never reach
+	 * rest_after_insert, so a deduplicated end-of-request sync covers both.
 	 */
 	public function monitorForScheduledPostStatus($new_status, $old_status, $post)
     {
@@ -1609,9 +1730,12 @@ class Broadstreet_Core
             && isset($post->ID)
             && !wp_is_post_revision($post->ID)
             && !wp_is_post_autosave($post->ID)
-            && !(defined('REST_REQUEST') && REST_REQUEST)
             && !isset($_POST['bs_sponsor_submit'])) {
+            if (defined('REST_REQUEST') && REST_REQUEST) {
+                $this->getSponsorController()->deferSyncToShutdown($post->ID);
+            } else {
 	            $this->syncSponsorPost($post->ID);
+            }
         }
 	}
 

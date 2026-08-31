@@ -65,7 +65,8 @@ class Broadstreet_Sponsor_Controller
         $post_id = absint($request['post_id']);
         return $post_id > 0
             && $this->core->isSponsorEditorPostType(get_post_type($post_id))
-            && current_user_can('edit_post', $post_id);
+            && current_user_can('edit_post', $post_id)
+            && current_user_can($this->core->getSponsorManageCapability());
     }
 
     public function getAdvertisers($request)
@@ -194,12 +195,19 @@ class Broadstreet_Sponsor_Controller
 
     public function retryStatus($request)
     {
+        $post_id = $this->resolveStatusPostId(absint($request['post_id']));
+
+        // A retry on a post that never touched sponsorship must not write
+        // status meta and opt it into the sync path.
+        if (!$this->postUsesSponsorship($post_id)) {
+            return $this->restResponse(
+                $this->publicStatus($this->core->getSponsorSync()->getStatus($post_id))
+            );
+        }
+
         return $this->restResponse(
             $this->publicStatus(
-                $this->core->getSponsorSync()->sync(
-                    $this->resolveStatusPostId(absint($request['post_id'])),
-                    true
-                )
+                $this->core->getSponsorSync()->sync($post_id, true)
             )
         );
     }
@@ -255,6 +263,7 @@ class Broadstreet_Sponsor_Controller
         $original_post_id = $sync->getRewriteRepublishOriginal($post_id);
         if ($original_post_id > 0) {
             if ($this->postUsesSponsorship($post_id)) {
+                self::$synced_this_request[$post_id] = true;
                 $sync->sync($post_id);
             }
             $post_id = $original_post_id;
@@ -264,7 +273,44 @@ class Broadstreet_Sponsor_Controller
             return false;
         }
 
+        self::$synced_this_request[$post_id] = true;
         return $sync->sync($post_id);
+    }
+
+    /**
+     * Posts already synchronized during this request, so a deferred
+     * end-of-request sync does not repeat work rest_after_insert did.
+     *
+     * @var array<int, bool>
+     */
+    protected static $synced_this_request = array();
+
+    /**
+     * Synchronize at shutdown, after every meta write of the request has
+     * landed. Used for REST publishes: transition_post_status fires before
+     * the REST controller persists meta, and custom REST routes never fire
+     * rest_after_insert at all.
+     */
+    public function deferSyncToShutdown($post_id)
+    {
+        $post_id = (int) $post_id;
+        if ($post_id <= 0) {
+            return;
+        }
+
+        $controller = $this;
+        add_action('shutdown', function () use ($controller, $post_id) {
+            $controller->syncPostUnlessAlreadySynced($post_id);
+        });
+    }
+
+    public function syncPostUnlessAlreadySynced($post_id)
+    {
+        if (isset(self::$synced_this_request[(int) $post_id])) {
+            return false;
+        }
+
+        return $this->syncPost($post_id);
     }
 
     protected function postUsesSponsorship($post_id)

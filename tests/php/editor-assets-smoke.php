@@ -47,6 +47,25 @@ function current_user_can($capability)
     return $broadstreet_current_user_can;
 }
 
+function apply_filters($hook, $value)
+{
+    return $value;
+}
+
+$broadstreet_inline_scripts = array();
+
+function wp_add_inline_script($handle, $data, $position = 'after')
+{
+    global $broadstreet_inline_scripts;
+
+    $broadstreet_inline_scripts[] = array($handle, $data, $position);
+}
+
+function wp_json_encode($value)
+{
+    return json_encode($value);
+}
+
 function plugins_url($path, $plugin_file)
 {
     global $broadstreet_plugins_url_base;
@@ -128,10 +147,18 @@ broadstreet_assert_same(
     'plugins_url() should resolve relative to the main plugin file.'
 );
 broadstreet_assert_same(
-    array('edit_posts'),
+    array('edit_posts', 'edit_others_posts'),
     $broadstreet_capability_checks,
-    'The editor asset loader should require post-editing capability.'
+    'The loader should require post-editing capability, then probe the sponsorship-management capability for the panel gate.'
 );
+broadstreet_assert_same(1, count($broadstreet_inline_scripts), 'The sponsorship capability should be passed to the editor script.');
+broadstreet_assert_same('broadstreet-editor', $broadstreet_inline_scripts[0][0], 'The inline settings should attach to the editor script.');
+broadstreet_assert_same(
+    'window.broadstreetEditor = {"canManageSponsorship":true};',
+    $broadstreet_inline_scripts[0][1],
+    'The inline settings should carry the sponsorship-management verdict.'
+);
+broadstreet_assert_same('before', $broadstreet_inline_scripts[0][2], 'The settings must be defined before the editor script runs.');
 
 $broadstreet_current_user_can = false;
 $broadstreet_enqueued_scripts = array();
@@ -143,7 +170,7 @@ broadstreet_assert_same(
     'The editor script should not be enqueued for users who cannot edit posts.'
 );
 broadstreet_assert_same(
-    array('edit_posts', 'edit_posts'),
+    array('edit_posts', 'edit_others_posts', 'edit_posts'),
     $broadstreet_capability_checks,
     'The post-editing capability should be checked when editor assets are enqueued.'
 );

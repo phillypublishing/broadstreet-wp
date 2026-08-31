@@ -268,6 +268,10 @@ function get_post_type($post_id)
 function current_user_can($capability, $post_id = null)
 {
     global $broadstreet_editable_posts;
+    if ($capability === 'edit_others_posts') {
+        return true;
+    }
+
     return $capability === 'edit_post' && in_array($post_id, $broadstreet_editable_posts, true);
 }
 
@@ -521,11 +525,19 @@ broadstreet_assert_same(
 );
 broadstreet_assert_same('no-store, private', $status_response->headers['Cache-Control'], 'Status responses should not be cached.');
 
+// A retry on a post that never touched sponsorship must not synchronize or
+// write status meta onto it.
+$pristine_retry = $core->retrySponsorStatus($allowed_request)->get_data();
+broadstreet_assert_same(array(), $core->fake_sync->sync_calls, 'Retrying a pristine post must not enter the sync path.');
+broadstreet_assert_same('error', $pristine_retry['state'], 'A pristine retry should just echo the stored status.');
+
+$broadstreet_rest_meta[42]['bs_sponsor_is_sponsored'] = '1';
 $retried = $core->retrySponsorStatus($allowed_request)->get_data();
 broadstreet_assert_same('synced', $retried['state'], 'Explicit status POST should synchronize immediately.');
 broadstreet_assert_same(array(array(42, true)), $core->fake_sync->sync_calls, 'REST retry must be marked explicit.');
 broadstreet_assert_same(false, strpos(json_encode($retried), 'secret'), 'Retry responses must retain the status allowlist.');
 $core->fake_sync->sync_calls = array();
+unset($broadstreet_rest_meta[42]);
 
 // A post that has never touched sponsorship is left completely alone.
 $untouched = $core->syncSponsorPost(43);
@@ -570,6 +582,23 @@ broadstreet_assert_same(
     array(array(42, true)),
     $core->fake_sync->sync_calls,
     'Explicit retries from a Rewrite & Republish draft should recover the original post.'
+);
+
+// The end-of-request deferred sync (REST publishes) never repeats work that
+// rest_after_insert already did in the same request.
+$core->fake_sync->sync_calls = array();
+$core->getSponsorController()->syncPostUnlessAlreadySynced(42);
+broadstreet_assert_same(
+    array(),
+    $core->fake_sync->sync_calls,
+    'A deferred sync must skip posts already synchronized during this request.'
+);
+$broadstreet_rest_meta[43] = array('bs_sponsor_is_sponsored' => '1');
+$core->getSponsorController()->syncPostUnlessAlreadySynced(43);
+broadstreet_assert_same(
+    array(array(43, false)),
+    $core->fake_sync->sync_calls,
+    'A deferred sync must cover posts no rest_after_insert hook reached.'
 );
 
 echo "Sponsor REST smoke test passed.\n";

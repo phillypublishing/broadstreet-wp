@@ -155,6 +155,10 @@ function current_user_can($capability, $post_id = null)
     global $broadstreet_capability_checks;
 
     $broadstreet_capability_checks[] = array($capability, $post_id);
+    if ($capability === 'edit_others_posts') {
+        return true;
+    }
+
     return $capability === 'edit_post' && $post_id === 42;
 }
 
@@ -311,14 +315,17 @@ foreach (array('post', 'page', 'story') as $post_type) {
 broadstreet_assert_same(
     array(
         array('edit_post', 42),
+        array('edit_others_posts', null),
         array('edit_post', 7),
         array('edit_post', 42),
+        array('edit_others_posts', null),
         array('edit_post', 7),
         array('edit_post', 42),
+        array('edit_others_posts', null),
         array('edit_post', 7),
     ),
     $broadstreet_capability_checks,
-    'Authorization must use edit_post with the actual object ID.'
+    'Authorization must use edit_post with the actual object ID plus the sponsorship-management capability.'
 );
 
 $core->addMetaBoxes();

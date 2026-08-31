@@ -34,6 +34,15 @@ const EMPTY_STATUS = {
 	updated_at: 0,
 };
 
+// Injected by the PHP enqueue. Sponsorship spends Broadstreet budget, so the
+// server tells us whether this user may manage it; zone info and ad
+// visibility stay available to every post editor.
+const canManageSponsorship = () =>
+	! (
+		window.broadstreetEditor &&
+		window.broadstreetEditor.canManageSponsorship === false
+	);
+
 const isSponsoredValue = ( value ) =>
 	value === true || value === 1 || value === '1' || value === 'true';
 
@@ -273,6 +282,7 @@ export function BroadstreetSponsorPanel() {
 	const currentSponsored = useRef( false );
 
 	const supported =
+		canManageSponsorship() &&
 		Object.prototype.hasOwnProperty.call(
 			editor.meta,
 			SPONSOR_ENABLED_KEY

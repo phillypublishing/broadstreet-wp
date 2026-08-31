@@ -84,6 +84,12 @@ function get_permalink($post_id)
     return 'https://example.test/post-' . $post_id;
 }
 
+function get_sample_permalink($post_id)
+{
+    // Hierarchical structures use %pagename% rather than %postname%.
+    return array('https://example.test/parent/%pagename%/', 'sample-' . $post_id);
+}
+
 function broadstreet_assert_same($expected, $actual, $message)
 {
     if ($expected !== $actual) {
@@ -189,6 +195,7 @@ broadstreet_assert_same('60', get_post_meta(10, Broadstreet_Sponsor_Sync::META_R
 // 6. A v3 network uses the analytics tracker type.
 $client->calls = array();
 $client->use_tracker_v3 = true;
+$broadstreet_titles[10] = 'Original story, v3 era';
 $sync->sync(10);
 broadstreet_assert_same('analytics_tracker', $client->calls[1][3]['type'], 'v3 networks should update with the analytics tracker type.');
 $client->use_tracker_v3 = false;
@@ -196,6 +203,7 @@ $client->use_tracker_v3 = false;
 // 7. A 404 on update reports a retryable error and leaves meta untouched.
 $client->calls = array();
 $client->update_exception = new Broadstreet_ServerException('missing', 404);
+$broadstreet_titles[10] = 'Original story, missing tracker';
 $status = $sync->sync(10);
 broadstreet_assert_same('error', $status['state'], 'A missing tracker should report an error.');
 broadstreet_assert_true($status['retryable'], 'A missing tracker should offer an explicit retry.');
@@ -212,6 +220,7 @@ broadstreet_assert_same('createAdvertisement', $client->calls[2][0], 'The explic
 // 9. Non-404 API failures report a retryable error without changing meta.
 $client->calls = array();
 $client->update_exception = new Exception('server down');
+$broadstreet_titles[10] = 'Original story, flaky API';
 $status = $sync->sync(10);
 broadstreet_assert_same('error', $status['state'], 'A failed update should report an error.');
 broadstreet_assert_true($status['retryable'], 'A failed update should be retryable.');
@@ -298,5 +307,43 @@ $broadstreet_meta_write_failures[23]['bs_sponsor_advertisement_id'] = true;
 $status = $sync->sync(23);
 broadstreet_assert_same('error', $status['state'], 'An unpersisted tracker ID should surface as an error.');
 broadstreet_assert_same(false, $status['retryable'], 'An unpersisted tracker ID must not advertise a blind retry.');
+
+// 16. A 404 on a move tries once addressed to the intended advertiser: a
+// lost response to an earlier move strands the old stamp while the tracker
+// already lives under the new advertiser.
+$broadstreet_meta[10]['bs_sponsor_advertiser_id'] = '70';
+$client->calls = array();
+$client->update_exception = new Broadstreet_ServerException('missing under old advertiser', 404);
+$status = $sync->sync(10);
+broadstreet_assert_same('synced', $status['state'], 'A move 404 should self-heal when the tracker lives under the intended advertiser.');
+broadstreet_assert_same('updateAdvertisement', $client->calls[1][0], 'The move should first address the stamped advertiser.');
+broadstreet_assert_same('60', $client->calls[1][1], 'The first attempt addresses the old advertiser.');
+broadstreet_assert_same('updateAdvertisement', $client->calls[2][0], 'The recovery should retry as a plain update.');
+broadstreet_assert_same('70', $client->calls[2][1], 'The recovery addresses the intended advertiser.');
+broadstreet_assert_same(false, isset($client->calls[2][3]['new_advertiser_id']), 'The recovery must not request another move.');
+broadstreet_assert_same('70', get_post_meta(10, Broadstreet_Sponsor_Sync::META_REMOTE_ADVERTISER, true), 'A recovered move should update the stamp.');
+
+// 17. An unchanged, already-synced post costs no HTTP at all on later saves.
+$client->calls = array();
+$status = $sync->sync(10);
+broadstreet_assert_same('synced', $status['state'], 'An unchanged post should still report synced.');
+broadstreet_assert_same(array(), $client->calls, 'An unchanged post must not reach the API.');
+$status = $sync->sync(10, true);
+broadstreet_assert_same('updateAdvertisement', $client->calls[1][0], 'An explicit retry must bypass the unchanged short-circuit.');
+
+// 18. Unpublished posts substitute the sample permalink token, including the
+// %pagename% form used by hierarchical post types.
+$broadstreet_statuses[25] = 'draft';
+$broadstreet_meta[25] = array(
+    'bs_sponsor_is_sponsored' => '1',
+    'bs_sponsor_advertiser_id' => '50',
+);
+$client->calls = array();
+$sync->sync(25);
+broadstreet_assert_same(
+    'https://example.test/parent/sample-25/',
+    $client->calls[1][4]['stencil_inputs']['url'],
+    'Draft trackers must substitute %pagename% sample-permalink tokens.'
+);
 
 echo "Sponsor sync smoke test passed.\n";

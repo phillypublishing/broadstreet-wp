@@ -17,6 +17,7 @@ class Broadstreet_Sponsor_Sync
 {
     const META_STATUS = '_bs_sponsor_reconciliation_status';
     const META_REMOTE_ADVERTISER = '_bs_sponsor_remote_advertiser_id';
+    const META_FINGERPRINT = '_bs_sponsor_reconciliation_fingerprint';
     const CREATE_GUARD_PREFIX = 'bs_sponsor_creating_';
     const CREATE_GUARD_TTL = 30;
 
@@ -78,20 +79,44 @@ class Broadstreet_Sponsor_Sync
             );
         }
 
+        $title = substr(str_pad((string) get_the_title($post_id), 5, '*'), 0, 127);
+        $url = $this->getTrackerUrl($post_id);
+        $advertisement_id = (string) get_post_meta($post_id, 'bs_sponsor_advertisement_id', true);
+
+        // Content-only saves of an already-synced post cost no HTTP at all.
+        // Explicit retries always re-sync.
+        $fingerprint = $this->fingerprint($advertiser_id, $title, $url);
+        if (!$explicit
+            && $this->isPositiveId($advertisement_id)
+            && (string) get_post_meta($post_id, self::META_FINGERPRINT, true) === $fingerprint) {
+            return $this->recordStatus(
+                $post_id,
+                'synced',
+                'Broadstreet tracking is synchronized.',
+                false
+            );
+        }
+
         $type = $this->getTrackerType($post_id);
         if ($type === false) {
             return $this->getStatus($post_id);
         }
 
-        $title = substr(str_pad((string) get_the_title($post_id), 5, '*'), 0, 127);
-        $url = $this->getTrackerUrl($post_id);
-        $advertisement_id = (string) get_post_meta($post_id, 'bs_sponsor_advertisement_id', true);
-
         if (!$this->isPositiveId($advertisement_id)) {
-            return $this->createTracker($post_id, $advertiser_id, $title, $url, $type);
+            return $this->createTracker($post_id, $advertiser_id, $title, $url, $type, $fingerprint);
         }
 
-        return $this->updateTracker($post_id, $advertiser_id, $advertisement_id, $title, $url, $type, $explicit);
+        return $this->updateTracker($post_id, $advertiser_id, $advertisement_id, $title, $url, $type, $explicit, $fingerprint);
+    }
+
+    /**
+     * Tracker type is deliberately excluded, matching the historical
+     * behavior: a network-level tracker-version change propagates on the
+     * next content change rather than forcing an update on every save.
+     */
+    protected function fingerprint($advertiser_id, $title, $url)
+    {
+        return 'v2:' . hash('sha256', json_encode(array($advertiser_id, $title, $url)));
     }
 
     /**
@@ -183,7 +208,7 @@ class Broadstreet_Sponsor_Sync
         }
     }
 
-    protected function createTracker($post_id, $advertiser_id, $title, $url, $type)
+    protected function createTracker($post_id, $advertiser_id, $title, $url, $type, $fingerprint)
     {
         $guard_key = self::CREATE_GUARD_PREFIX . $post_id;
         if (get_transient($guard_key)) {
@@ -252,6 +277,8 @@ class Broadstreet_Sponsor_Sync
             );
         }
 
+        update_post_meta($post_id, self::META_FINGERPRINT, $fingerprint);
+
         return $this->recordStatus(
             $post_id,
             'synced',
@@ -260,7 +287,7 @@ class Broadstreet_Sponsor_Sync
         );
     }
 
-    protected function updateTracker($post_id, $advertiser_id, $advertisement_id, $title, $url, $type, $explicit)
+    protected function updateTracker($post_id, $advertiser_id, $advertisement_id, $title, $url, $type, $explicit, $fingerprint)
     {
         // The tracker lives under the advertiser it was created (or last
         // moved) under; updating through a different advertiser 404s. When the
@@ -289,19 +316,46 @@ class Broadstreet_Sponsor_Sync
             );
         } catch (Broadstreet_ServerException $exception) {
             if ((int) $exception->code === 404) {
+                // A lost response to an earlier move strands the old
+                // advertiser stamp while the tracker already lives under the
+                // new advertiser. Before treating the tracker as missing, try
+                // once addressed to the intended advertiser.
+                if (isset($params['new_advertiser_id'])) {
+                    unset($params['new_advertiser_id']);
+                    try {
+                        $this->client->updateAdvertisement(
+                            $this->network_id,
+                            $advertiser_id,
+                            $advertisement_id,
+                            $params
+                        );
+                        update_post_meta($post_id, self::META_REMOTE_ADVERTISER, $advertiser_id);
+                        update_post_meta($post_id, self::META_FINGERPRINT, $fingerprint);
+                        return $this->recordStatus(
+                            $post_id,
+                            'synced',
+                            'Broadstreet tracking is synchronized.',
+                            false
+                        );
+                    } catch (Exception $recovery_exception) {
+                        // Fall through to the missing-tracker handling.
+                    }
+                }
+
                 if ($explicit) {
                     // The user asked for this recovery: abandon the missing
                     // tracker and create a fresh one. Never done automatically
                     // so a transient API problem cannot fork trackers.
                     delete_post_meta($post_id, 'bs_sponsor_advertisement_id');
                     delete_post_meta($post_id, self::META_REMOTE_ADVERTISER);
-                    return $this->createTracker($post_id, $advertiser_id, $title, $url, $type);
+                    delete_post_meta($post_id, self::META_FINGERPRINT);
+                    return $this->createTracker($post_id, $advertiser_id, $title, $url, $type, $fingerprint);
                 }
 
                 return $this->recordStatus(
                     $post_id,
                     'error',
-                    'Broadstreet could not find this post\'s tracker; it may have been deleted or moved in Broadstreet. Retry synchronization to create a new tracker.',
+                    'Broadstreet could not find this post\'s tracker under its recorded advertiser; it may have been deleted or moved in Broadstreet. Check the dashboard first, then retry synchronization to create a new tracker if it is gone.',
                     true
                 );
             }
@@ -322,6 +376,7 @@ class Broadstreet_Sponsor_Sync
         }
 
         update_post_meta($post_id, self::META_REMOTE_ADVERTISER, $advertiser_id);
+        update_post_meta($post_id, self::META_FINGERPRINT, $fingerprint);
 
         return $this->recordStatus(
             $post_id,
@@ -367,7 +422,8 @@ class Broadstreet_Sponsor_Sync
 
         if (function_exists('get_sample_permalink')) {
             $sample = get_sample_permalink($post_id);
-            return (string) preg_replace('/\%postname\%/', $sample[1], $sample[0]);
+            // Hierarchical post types use %pagename% in the sample structure.
+            return (string) preg_replace('/%(postname|pagename)%/', $sample[1], $sample[0]);
         }
 
         return (string) get_permalink($post_id);
