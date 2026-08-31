@@ -356,9 +356,11 @@ class Broadstreet_Fake_REST_Client
 class Broadstreet_Fake_REST_Sync
 {
     public $sync_calls = array();
+    public $status_calls = array();
 
     public function getStatus($post_id)
     {
+        $this->status_calls[] = $post_id;
         return array(
             'state' => 'error',
             'message' => 'Broadstreet could not update the tracker. Save or retry to try again.',
@@ -551,6 +553,23 @@ broadstreet_assert_same(
     array(array(44, false), array(42, false)),
     $core->fake_sync->sync_calls,
     'A Rewrite & Republish draft save should record its own status and synchronize the original.'
+);
+
+// The editor panel on a Rewrite & Republish draft must see, and be able to
+// retry, the ORIGINAL post's synchronization; the draft itself is always noop.
+$core->fake_sync->status_calls = array();
+$core->getSponsorStatus(new Broadstreet_Test_REST_Request(array('post_id' => 44)));
+broadstreet_assert_same(
+    array(42),
+    $core->fake_sync->status_calls,
+    'Status reads on a Rewrite & Republish draft should resolve to the original post.'
+);
+$core->fake_sync->sync_calls = array();
+$core->retrySponsorStatus(new Broadstreet_Test_REST_Request(array('post_id' => 44)));
+broadstreet_assert_same(
+    array(array(42, true)),
+    $core->fake_sync->sync_calls,
+    'Explicit retries from a Rewrite & Republish draft should recover the original post.'
 );
 
 echo "Sponsor REST smoke test passed.\n";

@@ -25,17 +25,18 @@ global $wpdb;
 $apply = isset($args) && is_array($args) && in_array('apply', $args, true);
 $label = $apply ? 'DELETE' : 'DRY RUN, would delete';
 
-// 1. Reconciler-era option locks.
-$lock_patterns = array(
-    '_broadstreet_sponsor_lock_%',
-    '_broadstreet_sponsor_advertiser_create_lock_%',
+// 1. Reconciler-era option locks. esc_like keeps the underscores literal.
+$lock_prefixes = array(
+    '_broadstreet_sponsor_lock_',
+    '_broadstreet_sponsor_advertiser_create_lock_',
 );
-foreach ($lock_patterns as $pattern) {
+foreach ($lock_prefixes as $prefix) {
+    $pattern = $wpdb->esc_like($prefix) . '%';
     $count = (int) $wpdb->get_var($wpdb->prepare(
         "SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name LIKE %s",
         $pattern
     ));
-    echo "{$label}: {$count} lock options matching {$pattern}\n";
+    echo "{$label}: {$count} lock options with prefix {$prefix}\n";
     if ($apply && $count > 0) {
         $wpdb->query($wpdb->prepare(
             "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s",
@@ -79,8 +80,9 @@ if (!$shared) {
     echo "No tracker IDs are shared between posts.\n";
 } else {
     foreach ($shared as $advertisement_id) {
+        // DISTINCT: duplicated meta rows on one post must not detach the keeper.
         $post_ids = $wpdb->get_col($wpdb->prepare(
-            "SELECT pm.post_id FROM {$wpdb->postmeta} pm
+            "SELECT DISTINCT pm.post_id FROM {$wpdb->postmeta} pm
              JOIN {$wpdb->posts} p ON p.ID = pm.post_id
              WHERE pm.meta_key = 'bs_sponsor_advertisement_id' AND pm.meta_value = %s
              ORDER BY p.post_date ASC, p.ID ASC",

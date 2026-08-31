@@ -28,9 +28,14 @@ function get_post_meta($post_id, $key = '', $single = false)
     return isset($broadstreet_meta[$post_id][$key]) ? $broadstreet_meta[$post_id][$key] : '';
 }
 
+$broadstreet_meta_write_failures = array();
+
 function update_post_meta($post_id, $key, $value)
 {
-    global $broadstreet_meta;
+    global $broadstreet_meta, $broadstreet_meta_write_failures;
+    if (isset($broadstreet_meta_write_failures[$post_id][$key])) {
+        return false;
+    }
     $broadstreet_meta[$post_id][$key] = $value;
     return true;
 }
@@ -233,18 +238,28 @@ broadstreet_assert_true($status['retryable'], 'A guarded create should be retrya
 broadstreet_assert_same(1, count($client->calls), 'Only the network lookup may run while the guard is held.');
 delete_transient(Broadstreet_Sponsor_Sync::CREATE_GUARD_PREFIX . '11');
 
-// 12. A Rewrite & Republish draft never syncs itself.
+// 12. A Rewrite & Republish draft never syncs itself, and any tracker state
+// Yoast's filterless copy gave it is scrubbed so a republish cannot copy the
+// original's (possibly stale) tracker identity back over the original.
 $broadstreet_meta[20] = array(
     '_dp_original' => '10',
     '_dp_is_rewrite_republish_copy' => '1',
     'bs_sponsor_is_sponsored' => '1',
     'bs_sponsor_advertiser_id' => '50',
+    'bs_sponsor_advertisement_id' => '901',
+    Broadstreet_Sponsor_Sync::META_REMOTE_ADVERTISER => '50',
+    '_bs_sponsor_remote_owner_post_id' => '10',
 );
 $client->calls = array();
 $status = $sync->sync(20);
 broadstreet_assert_same('noop', $status['state'], 'Rewrite & Republish drafts should report a noop.');
 broadstreet_assert_same(array(), $client->calls, 'Rewrite & Republish drafts must not reach the API.');
 broadstreet_assert_same(10, $sync->getRewriteRepublishOriginal(20), 'The draft should expose its original for syncing instead.');
+broadstreet_assert_same('', get_post_meta(20, 'bs_sponsor_advertisement_id', true), 'Inherited tracker IDs should be scrubbed from Rewrite & Republish drafts.');
+broadstreet_assert_same('', get_post_meta(20, Broadstreet_Sponsor_Sync::META_REMOTE_ADVERTISER, true), 'Inherited advertiser stamps should be scrubbed from Rewrite & Republish drafts.');
+broadstreet_assert_same('', get_post_meta(20, '_bs_sponsor_remote_owner_post_id', true), 'Legacy reconciler stamps should be scrubbed from Rewrite & Republish drafts.');
+broadstreet_assert_same('1', get_post_meta(20, 'bs_sponsor_is_sponsored', true), 'Editor-owned sponsor fields must survive the scrub.');
+broadstreet_assert_same('50', get_post_meta(20, 'bs_sponsor_advertiser_id', true), 'The draft advertiser selection must survive the scrub.');
 
 // 13. A plain Yoast duplicate (stale _dp_original, no republish marker) is an
 // ordinary post: it creates its own tracker rather than adopting the original's.
@@ -272,5 +287,16 @@ $broadstreet_meta[22] = array(
 );
 $status = $sync->sync(22);
 broadstreet_assert_same('synced', $status['state'], 'Legacy true-string toggles should still synchronize.');
+
+// 15. A create whose tracker ID cannot be persisted must not report synced:
+// the tracker exists remotely, and another automatic create would fork it.
+$broadstreet_meta[23] = array(
+    'bs_sponsor_is_sponsored' => '1',
+    'bs_sponsor_advertiser_id' => '50',
+);
+$broadstreet_meta_write_failures[23]['bs_sponsor_advertisement_id'] = true;
+$status = $sync->sync(23);
+broadstreet_assert_same('error', $status['state'], 'An unpersisted tracker ID should surface as an error.');
+broadstreet_assert_same(false, $status['retryable'], 'An unpersisted tracker ID must not advertise a blind retry.');
 
 echo "Sponsor sync smoke test passed.\n";

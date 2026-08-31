@@ -165,6 +165,8 @@ class Broadstreet_Core
         add_action('rest_api_init', array($this, 'registerZoneRoutes'));
         add_filter('update_post_metadata', array($this, 'captureSponsorAdvertiserBeforeUpdate'), 10, 5);
         add_filter('duplicate_post_excludelist_filter', array($this, 'excludeSponsorMetaFromDuplication'));
+        add_action('duplicate_post_before_republish', array($this, 'purgeSponsorMetaBeforeRepublish'), 10, 2);
+        add_action('duplicate_post_after_republish', array($this, 'syncSponsorAfterRepublish'), 10, 2);
         add_action('admin_init', 	array($this, 'adminInitCallback' ));        
         add_action('wp', array($this, 'captureAdVisibilityState'));
         add_action('wp_enqueue_scripts',          array($this, 'addCDNScript' ));
@@ -641,6 +643,10 @@ class Broadstreet_Core
      * excluding these keys means a plain duplicate simply creates its own
      * tracker on first save. The wildcard also covers sync status and any
      * legacy reconciliation journal keys.
+     *
+     * Yoast's Rewrite & Republish paths run with use_filters=false and bypass
+     * this filter entirely, so those copies are scrubbed separately: on every
+     * sync attempt of the draft and again on duplicate_post_before_republish.
      */
     public function excludeSponsorMetaFromDuplication($meta_excludelist)
     {
@@ -651,6 +657,36 @@ class Broadstreet_Core
                 '_bs_sponsor_*',
             )
         );
+    }
+
+    /**
+     * A Rewrite & Republish copy is created without meta filters, so it can
+     * carry the original's (possibly stale) tracker state. Republishing copies
+     * the draft's meta back over the original, so scrub the draft first; the
+     * original then keeps its own current tracker identity.
+     */
+    public function purgeSponsorMetaBeforeRepublish($copy, $original_post)
+    {
+        $copy_id = is_object($copy) && isset($copy->ID) ? (int) $copy->ID : (int) $copy;
+        if ($copy_id > 0) {
+            $this->getSponsorSync()->purgeServerMeta($copy_id);
+        }
+    }
+
+    /**
+     * After Yoast finishes a republish the original holds the draft's title
+     * and editor-owned sponsor fields, so one fresh sync updates the tracker.
+     * This is the only reliable point for scheduled republishes, which run
+     * after the transition hooks have already fired.
+     */
+    public function syncSponsorAfterRepublish($copy, $original_post)
+    {
+        $original_post_id = is_object($original_post) && isset($original_post->ID)
+            ? (int) $original_post->ID
+            : (int) $original_post;
+        if ($original_post_id > 0) {
+            $this->syncSponsorPost($original_post_id);
+        }
     }
 
     public function isSponsorEditorPostType($post_type)

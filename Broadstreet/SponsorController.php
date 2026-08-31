@@ -185,7 +185,9 @@ class Broadstreet_Sponsor_Controller
     {
         return $this->restResponse(
             $this->publicStatus(
-                $this->core->getSponsorSync()->getStatus(absint($request['post_id']))
+                $this->core->getSponsorSync()->getStatus(
+                    $this->resolveStatusPostId(absint($request['post_id']))
+                )
             )
         );
     }
@@ -194,9 +196,27 @@ class Broadstreet_Sponsor_Controller
     {
         return $this->restResponse(
             $this->publicStatus(
-                $this->core->getSponsorSync()->sync(absint($request['post_id']), true)
+                $this->core->getSponsorSync()->sync(
+                    $this->resolveStatusPostId(absint($request['post_id'])),
+                    true
+                )
             )
         );
+    }
+
+    /**
+     * The editor panel on a Rewrite & Republish draft must surface, and be
+     * able to retry, the original post's synchronization: the draft itself is
+     * always a noop and any failure lands on the original.
+     */
+    protected function resolveStatusPostId($post_id)
+    {
+        $original_post_id = $this->core->getSponsorSync()->getRewriteRepublishOriginal($post_id);
+        if ($original_post_id > 0 && current_user_can('edit_post', $original_post_id)) {
+            return $original_post_id;
+        }
+
+        return $post_id;
     }
 
     protected function restResponse($data)

@@ -46,6 +46,11 @@ class Broadstreet_Sponsor_Sync
         }
 
         if ($this->isRewriteRepublishCopy($post_id)) {
+            // Yoast creates and republishes these copies with meta filters
+            // disabled, so the copy may carry the original's tracker state.
+            // Scrub it here as well, so a republish can only ever copy
+            // editor-owned fields back onto the original.
+            $this->purgeServerMeta($post_id);
             return $this->recordStatus(
                 $post_id,
                 'noop',
@@ -155,6 +160,29 @@ class Broadstreet_Sponsor_Sync
         return (int) get_post_meta($post_id, '_dp_original', true);
     }
 
+    /**
+     * Remove every server-owned tracker key from a post, including the
+     * journals and stamps written by the retired reconciler. Used on
+     * duplicated posts that must never carry another post's tracker identity.
+     */
+    public function purgeServerMeta($post_id)
+    {
+        $keys = array(
+            'bs_sponsor_advertisement_id',
+            self::META_REMOTE_ADVERTISER,
+            self::META_STATUS,
+            '_bs_sponsor_remote_owner_post_id',
+            '_bs_sponsor_reconciliation_fingerprint',
+            '_bs_sponsor_tracker_create_attempt',
+            '_bs_sponsor_tracker_move_attempt',
+            '_bs_sponsor_advertiser_create_attempt',
+        );
+
+        foreach ($keys as $key) {
+            delete_post_meta((int) $post_id, $key);
+        }
+    }
+
     protected function createTracker($post_id, $advertiser_id, $title, $url, $type)
     {
         $guard_key = self::CREATE_GUARD_PREFIX . $post_id;
@@ -212,6 +240,17 @@ class Broadstreet_Sponsor_Sync
 
         update_post_meta($post_id, 'bs_sponsor_advertisement_id', $advertisement_id);
         update_post_meta($post_id, self::META_REMOTE_ADVERTISER, $advertiser_id);
+
+        // The tracker exists remotely now; if its ID did not persist locally,
+        // another automatic create would fork trackers, so report it instead.
+        if ((string) get_post_meta($post_id, 'bs_sponsor_advertisement_id', true) !== $advertisement_id) {
+            return $this->recordStatus(
+                $post_id,
+                'error',
+                'Broadstreet created a tracker, but WordPress could not store its ID. Check the Broadstreet dashboard before retrying.',
+                false
+            );
+        }
 
         return $this->recordStatus(
             $post_id,

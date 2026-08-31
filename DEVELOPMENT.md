@@ -76,13 +76,24 @@ the generic meta APIs; only the plugin writes them.
 Duplicated posts stay safe by construction rather than by ownership proofs:
 
 - The `duplicate_post_excludelist_filter` hook excludes
-  `bs_sponsor_advertisement_id` and all `_bs_sponsor_*` keys from every Yoast
-  Duplicate Post copy, so no copy can inherit tracker state. A plain duplicate
-  that is marked sponsored simply creates its own tracker on first save.
+  `bs_sponsor_advertisement_id` and all `_bs_sponsor_*` keys from plain Yoast
+  Duplicate Post copies, so a duplicate that is marked sponsored simply
+  creates its own tracker on first save.
+- Yoast's Rewrite & Republish paths run with `use_filters = false` and bypass
+  that excludelist, on both copy creation and republish-time meta copying.
+  R&R drafts are therefore scrubbed of server-owned keys explicitly: on every
+  sync attempt of the draft and again on `duplicate_post_before_republish`,
+  so a republish can only copy editor-owned fields (toggle, advertiser) back
+  onto the original, never a stale tracker identity.
 - A Rewrite & Republish draft (`_dp_is_rewrite_republish_copy`) never
-  synchronizes itself. Saving or republishing the draft re-synchronizes the
-  original post, which owns the tracker. A stale `_dp_original` alone (present
-  forever on every Yoast copy) does not mark a post as a republish draft.
+  synchronizes itself. Saving the draft re-synchronizes the original post,
+  and `duplicate_post_after_republish` re-synchronizes it once more with the
+  republished title/fields — the only reliable point for scheduled
+  republishes, which Yoast performs after the publish transition hooks. A
+  stale `_dp_original` alone (present forever on every Yoast copy) does not
+  mark a post as a republish draft.
+- The draft's editor panel reads and retries the original post's sync status:
+  the status REST routes resolve an R&R draft to its `_dp_original`.
 
 If Broadstreet returns 404 for a stored tracker ID, automatic syncs report a
 retryable error and never abandon the ID; the explicit **Retry
