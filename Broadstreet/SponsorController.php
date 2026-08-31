@@ -1,13 +1,16 @@
 <?php
 
 /**
- * Sponsor-specific REST, advertiser-create, status, and queue orchestration.
+ * Sponsor-specific REST, advertiser-create, status, and sync orchestration.
  *
  * Broadstreet_Core keeps public compatibility delegates while this controller
  * provides one narrow foundation for the sponsored-content editor features.
  */
 class Broadstreet_Sponsor_Controller
 {
+    const ADVERTISER_CREATE_GUARD_PREFIX = 'bs_advertiser_creating_';
+    const ADVERTISER_CREATE_GUARD_TTL = 30;
+
     protected $core;
 
     public function __construct($core)
@@ -62,7 +65,8 @@ class Broadstreet_Sponsor_Controller
         $post_id = absint($request['post_id']);
         return $post_id > 0
             && $this->core->isSponsorEditorPostType(get_post_type($post_id))
-            && current_user_can('edit_post', $post_id);
+            && current_user_can('edit_post', $post_id)
+            && current_user_can($this->core->getSponsorManageCapability());
     }
 
     public function getAdvertisers($request)
@@ -121,22 +125,51 @@ class Broadstreet_Sponsor_Controller
             );
         }
 
-        $lock_key = '_broadstreet_sponsor_advertiser_create_lock_' . (int) $post_id;
-        $locks = new Broadstreet_Option_Lock();
-        $lock = $locks->acquire($lock_key);
-        if ($lock === false) {
+        $guard_key = self::ADVERTISER_CREATE_GUARD_PREFIX . (int) $post_id;
+        if (get_transient($guard_key)) {
             return new WP_Error(
                 'broadstreet_advertiser_create_in_progress',
                 'Broadstreet advertiser creation is already in progress. Wait for it to finish before trying again.',
                 array('status' => 409)
             );
         }
+        set_transient($guard_key, 1, self::ADVERTISER_CREATE_GUARD_TTL);
 
         try {
-            return $this->createAdvertiserWithinLock($post_id, $name, $locks, $lock_key, $lock);
-        } finally {
-            $locks->release($lock_key, $lock);
+            $advertiser = $this->core->getSponsorBroadstreetClient()->createAdvertiser(
+                Broadstreet_Utility::getOption(Broadstreet_Core::KEY_NETWORK_ID),
+                $name
+            );
+        } catch (Exception $exception) {
+            delete_transient($guard_key);
+            if ($exception instanceof Broadstreet_ServerException
+                && (int) $exception->code === 422) {
+                return new WP_Error(
+                    'broadstreet_advertiser_rejected',
+                    'Broadstreet rejected that advertiser name. Correct the name before trying again.',
+                    array('status' => 422)
+                );
+            }
+
+            return new WP_Error(
+                'broadstreet_advertiser_create_failed',
+                'Broadstreet could not create the advertiser. Try again.',
+                array('status' => 502)
+            );
         }
+
+        delete_transient($guard_key);
+
+        $advertiser_id = isset($advertiser->id) ? (string) $advertiser->id : '';
+        if (!preg_match('/^[1-9][0-9]*$/D', $advertiser_id)) {
+            return new WP_Error(
+                'broadstreet_advertiser_create_failed',
+                'Broadstreet did not return an advertiser ID. Check the Broadstreet dashboard before trying again.',
+                array('status' => 502)
+            );
+        }
+
+        return array('id' => $advertiser_id, 'name' => $name);
     }
 
     protected function stringLength($value)
@@ -149,159 +182,49 @@ class Broadstreet_Sponsor_Controller
         return $count === false ? strlen($value) : $count;
     }
 
-    protected function createAdvertiserWithinLock($post_id, $name, $locks, $lock_key, $lock)
-    {
-        if (!$locks->owns($lock_key, $lock)) {
-            return new WP_Error(
-                'broadstreet_advertiser_create_in_progress',
-                'Broadstreet advertiser creation is already in progress. Wait for it to finish before trying again.',
-                array('status' => 409)
-            );
-        }
-
-        $fingerprint = hash('sha256', $post_id . "\n" . $name);
-        $attempt = get_post_meta($post_id, Broadstreet_Core::META_ADVERTISER_CREATE_ATTEMPT, true);
-
-        if (is_array($attempt) && isset($attempt['state'])) {
-            if (in_array($attempt['state'], array('dispatching', 'outcome_unknown'), true)) {
-                $message = 'Broadstreet may have created the advertiser. Check the Broadstreet dashboard before trying again.';
-                $this->core->getSponsorReconciler()->recordStatus($post_id, 'needs_action', $message, false);
-                return new WP_Error(
-                    'broadstreet_advertiser_outcome_unknown',
-                    $message,
-                    array('status' => 409)
-                );
-            }
-
-            if (isset($attempt['fingerprint'])
-                && $attempt['fingerprint'] === $fingerprint
-                && $attempt['state'] === 'complete'
-                && isset($attempt['advertiser_id'])
-                && preg_match('/^[1-9][0-9]*$/D', (string) $attempt['advertiser_id'])) {
-                return array('id' => (string) $attempt['advertiser_id'], 'name' => $name);
-            }
-
-            if (isset($attempt['fingerprint'])
-                && $attempt['fingerprint'] === $fingerprint
-                && $attempt['state'] === 'definite_failure') {
-                // Reaching this method is itself an explicit advertiser-create
-                // action. A definite 422 proves no remote object was created,
-                // so the user may retry after correcting account-side state.
-            }
-        }
-
-        $attempt = array(
-            'state' => 'dispatching',
-            'fingerprint' => $fingerprint,
-            'created_at' => time(),
-        );
-        update_post_meta($post_id, Broadstreet_Core::META_ADVERTISER_CREATE_ATTEMPT, $attempt);
-        $persisted_attempt = get_post_meta($post_id, Broadstreet_Core::META_ADVERTISER_CREATE_ATTEMPT, true);
-        if (!$this->isExactAttempt($persisted_attempt, $attempt)) {
-            $message = 'Broadstreet could not safely record the advertiser creation attempt. Try again.';
-            $this->core->getSponsorReconciler()->recordStatus($post_id, 'error', $message, true);
-            return new WP_Error(
-                'broadstreet_advertiser_state_persistence_failed',
-                $message,
-                array('status' => 500)
-            );
-        }
-
-        if (!$locks->owns($lock_key, $lock)) {
-            return new WP_Error(
-                'broadstreet_advertiser_create_in_progress',
-                'Broadstreet advertiser creation is already in progress. Wait for it to finish before trying again.',
-                array('status' => 409)
-            );
-        }
-
-        try {
-            $advertiser = $this->core->getSponsorBroadstreetClient()->createAdvertiser(
-                Broadstreet_Utility::getOption(Broadstreet_Core::KEY_NETWORK_ID),
-                $name
-            );
-        } catch (Exception $exception) {
-            $definite_failure = $exception instanceof Broadstreet_ServerException
-                && (int) $exception->code === 422;
-            $attempt['state'] = $definite_failure ? 'definite_failure' : 'outcome_unknown';
-            update_post_meta($post_id, Broadstreet_Core::META_ADVERTISER_CREATE_ATTEMPT, $attempt);
-
-            $message = $definite_failure
-                ? 'Broadstreet rejected that advertiser name. Correct the name before trying again.'
-                : 'Broadstreet may have created the advertiser. Check the Broadstreet dashboard before trying again.';
-            $this->core->getSponsorReconciler()->recordStatus(
-                $post_id,
-                $definite_failure ? 'error' : 'needs_action',
-                $message,
-                false
-            );
-            return new WP_Error(
-                $definite_failure ? 'broadstreet_advertiser_rejected' : 'broadstreet_advertiser_outcome_unknown',
-                $message,
-                array('status' => $definite_failure ? 422 : 502)
-            );
-        }
-
-        $advertiser_id = isset($advertiser->id) ? (string) $advertiser->id : '';
-        if (!preg_match('/^[1-9][0-9]*$/D', $advertiser_id)) {
-            $attempt['state'] = 'outcome_unknown';
-            update_post_meta($post_id, Broadstreet_Core::META_ADVERTISER_CREATE_ATTEMPT, $attempt);
-            $message = 'Broadstreet may have created the advertiser, but WordPress could not confirm its ID. Check the Broadstreet dashboard before trying again.';
-            $this->core->getSponsorReconciler()->recordStatus($post_id, 'needs_action', $message, false);
-            return new WP_Error(
-                'broadstreet_advertiser_outcome_unknown',
-                $message,
-                array('status' => 502)
-            );
-        }
-
-        $attempt['state'] = 'complete';
-        $attempt['advertiser_id'] = $advertiser_id;
-        update_post_meta($post_id, Broadstreet_Core::META_ADVERTISER_CREATE_ATTEMPT, $attempt);
-        $persisted_attempt = get_post_meta($post_id, Broadstreet_Core::META_ADVERTISER_CREATE_ATTEMPT, true);
-        if (!is_array($persisted_attempt)
-            || !isset($persisted_attempt['state'])
-            || $persisted_attempt['state'] !== 'complete'
-            || !isset($persisted_attempt['advertiser_id'])
-            || (string) $persisted_attempt['advertiser_id'] !== $advertiser_id) {
-            $attempt['state'] = 'outcome_unknown';
-            update_post_meta($post_id, Broadstreet_Core::META_ADVERTISER_CREATE_ATTEMPT, $attempt);
-            $message = 'Broadstreet created the advertiser, but WordPress could not safely persist its ID. Check the Broadstreet dashboard before trying again.';
-            $this->core->getSponsorReconciler()->recordStatus($post_id, 'needs_action', $message, false);
-            return new WP_Error(
-                'broadstreet_advertiser_outcome_unknown',
-                $message,
-                array('status' => 500)
-            );
-        }
-
-        return array('id' => $advertiser_id, 'name' => $name);
-    }
-
-    protected function isExactAttempt($persisted, $expected)
-    {
-        return is_array($persisted)
-            && isset($persisted['state'], $persisted['fingerprint'])
-            && $persisted['state'] === $expected['state']
-            && $persisted['fingerprint'] === $expected['fingerprint'];
-    }
-
     public function getStatus($request)
     {
         return $this->restResponse(
             $this->publicStatus(
-                $this->core->getSponsorReconciler()->getStatus(absint($request['post_id']))
+                $this->core->getSponsorSync()->getStatus(
+                    $this->resolveStatusPostId(absint($request['post_id']))
+                )
             )
         );
     }
 
     public function retryStatus($request)
     {
+        $post_id = $this->resolveStatusPostId(absint($request['post_id']));
+
+        // A retry on a post that never touched sponsorship must not write
+        // status meta and opt it into the sync path.
+        if (!$this->postUsesSponsorship($post_id)) {
+            return $this->restResponse(
+                $this->publicStatus($this->core->getSponsorSync()->getStatus($post_id))
+            );
+        }
+
         return $this->restResponse(
             $this->publicStatus(
-                $this->core->getSponsorReconciler()->reconcile(absint($request['post_id']), true)
+                $this->core->getSponsorSync()->sync($post_id, true)
             )
         );
+    }
+
+    /**
+     * The editor panel on a Rewrite & Republish draft must surface, and be
+     * able to retry, the original post's synchronization: the draft itself is
+     * always a noop and any failure lands on the original.
+     */
+    protected function resolveStatusPostId($post_id)
+    {
+        $original_post_id = $this->core->getSponsorSync()->getRewriteRepublishOriginal($post_id);
+        if ($original_post_id > 0 && current_user_can('edit_post', $original_post_id)) {
+            return $original_post_id;
+        }
+
+        return $post_id;
     }
 
     protected function restResponse($data)
@@ -319,52 +242,84 @@ class Broadstreet_Sponsor_Controller
             'message' => isset($status['message']) ? (string) $status['message'] : '',
             'retryable' => !empty($status['retryable']),
             'updated_at' => isset($status['updated_at']) ? (int) $status['updated_at'] : 0,
-            'poll_after' => isset($status['state']) && $status['state'] === 'queued' ? 2 : 0,
         );
     }
 
-    public function queuePost($post_id)
+    /**
+     * Synchronize a saved post inline. Posts that have never touched
+     * sponsorship are left completely alone so ordinary saves write no meta.
+     * A Rewrite & Republish draft never syncs itself; its original does, so
+     * saving or republishing the draft keeps the original's tracker current.
+     */
+    public function syncPost($post_id)
     {
         $post_id = (int) $post_id;
         if ($post_id <= 0 || !Broadstreet_Utility::getOption(Broadstreet_Core::KEY_API_KEY)) {
             return false;
         }
 
-        $reconciler = $this->core->getSponsorReconciler();
-        if (!$this->core->sanitizeSponsorBoolean(get_post_meta($post_id, 'bs_sponsor_is_sponsored', true))) {
-            return $reconciler->recordStatus(
-                $post_id,
-                'disabled',
-                'Broadstreet tracking is disabled for this post.',
-                false
-            );
+        $sync = $this->core->getSponsorSync();
+
+        $original_post_id = $sync->getRewriteRepublishOriginal($post_id);
+        if ($original_post_id > 0) {
+            if ($this->postUsesSponsorship($post_id)) {
+                self::$synced_this_request[$post_id] = true;
+                $sync->sync($post_id);
+            }
+            $post_id = $original_post_id;
         }
 
-        if ($this->core->sanitizeSponsorAdvertiserId(get_post_meta($post_id, 'bs_sponsor_advertiser_id', true)) === '') {
-            return $reconciler->recordStatus(
-                $post_id,
-                'waiting',
-                'Select an advertiser, then save the post to enable Broadstreet tracking.',
-                false
-            );
+        if (!$this->postUsesSponsorship($post_id)) {
+            return false;
         }
 
-        $args = array($post_id);
-        if (!wp_next_scheduled(Broadstreet_Sponsor_Reconciler::RETRY_HOOK, $args)
-            && !wp_schedule_single_event(time() + 1, Broadstreet_Sponsor_Reconciler::RETRY_HOOK, $args)) {
-            return $reconciler->recordStatus(
-                $post_id,
-                'error',
-                'Broadstreet synchronization could not be queued. Use Retry synchronization to try again.',
-                true
-            );
+        self::$synced_this_request[$post_id] = true;
+        return $sync->sync($post_id);
+    }
+
+    /**
+     * Posts already synchronized during this request, so a deferred
+     * end-of-request sync does not repeat work rest_after_insert did.
+     *
+     * @var array<int, bool>
+     */
+    protected static $synced_this_request = array();
+
+    /**
+     * Synchronize at shutdown, after every meta write of the request has
+     * landed. Used for REST publishes: transition_post_status fires before
+     * the REST controller persists meta, and custom REST routes never fire
+     * rest_after_insert at all.
+     */
+    public function deferSyncToShutdown($post_id)
+    {
+        $post_id = (int) $post_id;
+        if ($post_id <= 0) {
+            return;
         }
 
-        return $reconciler->recordStatus(
-            $post_id,
-            'queued',
-            'Broadstreet synchronization is queued.',
-            false
-        );
+        $controller = $this;
+        add_action('shutdown', function () use ($controller, $post_id) {
+            $controller->syncPostUnlessAlreadySynced($post_id);
+        });
+    }
+
+    public function syncPostUnlessAlreadySynced($post_id)
+    {
+        if (isset(self::$synced_this_request[(int) $post_id])) {
+            return false;
+        }
+
+        return $this->syncPost($post_id);
+    }
+
+    protected function postUsesSponsorship($post_id)
+    {
+        // metadata_exists, not get_post_meta: registered defaults would make
+        // the boolean read false instead of empty on untouched posts.
+        return metadata_exists('post', $post_id, 'bs_sponsor_is_sponsored')
+            || get_post_meta($post_id, 'bs_sponsor_advertiser_id', true) !== ''
+            || get_post_meta($post_id, 'bs_sponsor_advertisement_id', true) !== ''
+            || get_post_meta($post_id, Broadstreet_Sponsor_Sync::META_STATUS, true) !== '';
     }
 }

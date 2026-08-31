@@ -32,8 +32,16 @@ const EMPTY_STATUS = {
 	message: '',
 	retryable: false,
 	updated_at: 0,
-	poll_after: 0,
 };
+
+// Injected by the PHP enqueue. Sponsorship spends Broadstreet budget, so the
+// server tells us whether this user may manage it; zone info and ad
+// visibility stay available to every post editor.
+const canManageSponsorship = () =>
+	! (
+		window.broadstreetEditor &&
+		window.broadstreetEditor.canManageSponsorship === false
+	);
 
 const isSponsoredValue = ( value ) =>
 	value === true || value === 1 || value === '1' || value === 'true';
@@ -41,7 +49,6 @@ const isSponsoredValue = ( value ) =>
 const isPositiveId = ( value ) => /^[1-9][0-9]*$/.test( String( value ) );
 
 const unicodeLength = ( value ) => Array.from( value ).length;
-const MAX_QUEUED_STATUS_POLLS = 30;
 
 const advertiserCreateErrorStatus = ( code ) => {
 	switch ( code ) {
@@ -56,7 +63,7 @@ const advertiserCreateErrorStatus = ( code ) => {
 			};
 		case 'broadstreet_advertiser_create_in_progress':
 			return {
-				state: 'queued',
+				state: 'error',
 				message: __(
 					'Broadstreet advertiser creation is already in progress. Wait for it to finish before trying again.',
 					'broadstreet_textdomain'
@@ -71,24 +78,6 @@ const advertiserCreateErrorStatus = ( code ) => {
 					'broadstreet_textdomain'
 				),
 				retryable: false,
-			};
-		case 'broadstreet_advertiser_outcome_unknown':
-			return {
-				state: 'needs_action',
-				message: __(
-					'Broadstreet could not confirm advertiser creation. Check the Broadstreet dashboard before trying again.',
-					'broadstreet_textdomain'
-				),
-				retryable: false,
-			};
-		case 'broadstreet_advertiser_state_persistence_failed':
-			return {
-				state: 'error',
-				message: __(
-					'Broadstreet could not safely record advertiser creation. Try again.',
-					'broadstreet_textdomain'
-				),
-				retryable: true,
 			};
 		default:
 			return {
@@ -291,10 +280,9 @@ export function BroadstreetSponsorPanel() {
 	const createRequest = useRef( 0 );
 	const currentPostId = useRef( editor.postId );
 	const currentSponsored = useRef( false );
-	const queuedPollCount = useRef( 0 );
-	const [ queuedPollTick, setQueuedPollTick ] = useState( 0 );
 
 	const supported =
+		canManageSponsorship() &&
 		Object.prototype.hasOwnProperty.call(
 			editor.meta,
 			SPONSOR_ENABLED_KEY
@@ -423,37 +411,6 @@ export function BroadstreetSponsorPanel() {
 		}
 		previousSaving.current = saving;
 	}, [ editor.isAutosaving, editor.isSaving, loadStatus ] );
-
-	useEffect( () => {
-		if ( status.state !== 'queued' ) {
-			queuedPollCount.current = 0;
-			return undefined;
-		}
-		if ( queuedPollCount.current >= MAX_QUEUED_STATUS_POLLS ) {
-			setStatus( {
-				...EMPTY_STATUS,
-				state: 'error',
-				message: __(
-					'Broadstreet synchronization is still queued. Check WP-Cron, then retry synchronization.',
-					'broadstreet_textdomain'
-				),
-				retryable: true,
-			} );
-			return undefined;
-		}
-
-		const pollAfter = Number( status.poll_after || 2 );
-		const timer = setTimeout(
-			() => {
-				queuedPollCount.current += 1;
-				loadStatus().finally( () =>
-					setQueuedPollTick( ( current ) => current + 1 )
-				);
-			},
-			Math.max( 1, pollAfter ) * 1000
-		);
-		return () => clearTimeout( timer );
-	}, [ loadStatus, queuedPollTick, status.poll_after, status.state ] );
 
 	const createAdvertiser = () => {
 		const name = advertiserName.trim();
