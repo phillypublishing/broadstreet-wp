@@ -106,10 +106,95 @@ function update_post_meta($post_id, $key, $value)
     return true;
 }
 
-function add_post_meta($post_id, $key, $value)
+/**
+ * A manual write to land at a chosen moment of the default fill: run once,
+ * just before the fill's own database write (the conditional UPDATE or the
+ * unique insert), as an editor's save racing it would.
+ */
+$broadstreet_before_meta_write = null;
+function broadstreet_run_before_meta_write()
 {
-    return update_post_meta($post_id, $key, $value);
+    global $broadstreet_before_meta_write;
+    if ($broadstreet_before_meta_write !== null) {
+        $callback = $broadstreet_before_meta_write;
+        $broadstreet_before_meta_write = null;
+        $callback();
+    }
 }
+
+$broadstreet_cache_deletes = 0;
+function wp_cache_delete($key, $group = '')
+{
+    global $broadstreet_cache_deletes;
+    $broadstreet_cache_deletes++;
+    return true;
+}
+
+function do_action($hook)
+{
+    $args = func_get_args();
+    call_user_func_array('apply_filters', $args);
+}
+
+// Like WordPress: with $unique, a key that already exists is refused.
+function add_post_meta($post_id, $key, $value, $unique = false)
+{
+    global $broadstreet_meta, $broadstreet_meta_write_failures;
+    broadstreet_run_before_meta_write();
+    if ($unique && metadata_exists('post', $post_id, $key)) {
+        return false;
+    }
+    if (isset($broadstreet_meta_write_failures[$post_id][$key])) {
+        return false;
+    }
+    $broadstreet_meta[$post_id][$key] = $value;
+    do_action('added_post_meta', 1, $post_id, $key, $value);
+    return 1;
+}
+
+// The two queries the default fill makes, against the same meta store.
+class Broadstreet_Test_Decision_DB
+{
+    public $postmeta = 'wp_postmeta';
+    public $queries = array();
+
+    public function prepare($query)
+    {
+        $args = func_get_args();
+        array_shift($args);
+        return array($query, $args);
+    }
+
+    public function get_var($prepared)
+    {
+        $this->queries[] = $prepared[0];
+        list($post_id, $key) = $prepared[1];
+        if (strpos($prepared[0], "SELECT meta_id FROM wp_postmeta WHERE post_id = %d AND meta_key = %s AND meta_value = ''") !== 0) {
+            throw new RuntimeException('Unexpected query: ' . $prepared[0]);
+        }
+        return metadata_exists('post', $post_id, $key) && get_post_meta($post_id, $key, true) === '' ? '1' : null;
+    }
+
+    public function query($prepared)
+    {
+        global $broadstreet_meta, $broadstreet_meta_write_failures;
+        $this->queries[] = $prepared[0];
+        if ($prepared[0] !== "UPDATE wp_postmeta SET meta_value = %s WHERE post_id = %d AND meta_key = %s AND meta_id = %d AND meta_value = ''") {
+            throw new RuntimeException('Unexpected query: ' . $prepared[0]);
+        }
+        broadstreet_run_before_meta_write();
+        list($value, $post_id, $key) = $prepared[1];
+        if (isset($broadstreet_meta_write_failures[$post_id][$key])
+            || !metadata_exists('post', $post_id, $key)
+            || $broadstreet_meta[$post_id][$key] !== '') {
+            return 0;
+        }
+        $broadstreet_meta[$post_id][$key] = $value;
+        return 1;
+    }
+}
+
+$wpdb = new Broadstreet_Test_Decision_DB();
 
 function delete_post_meta($post_id, $key)
 {
@@ -489,6 +574,107 @@ $client->calls = array();
 $status = $sync->sync($post_id);
 broadstreet_assert_same(array('error', true), array($status['state'], $status['retryable']), 'An unstored default advertiser should be a retryable error.');
 broadstreet_assert_same(array(), $client->calls, 'An unstored default advertiser must not reach the API.');
+
+// The default fill decides at the write: an editor's pick that lands while
+// it runs wins, and the post syncs with it. Each case: where the row starts
+// (absent, or present and empty) and when the editor's 60 lands.
+$answer = array('advertiser_id' => '77', 'source' => 'default');
+$editor_picks = function ($post_id) {
+    return function () use ($post_id) {
+        global $broadstreet_meta;
+        $broadstreet_meta[$post_id]['bs_sponsor_advertiser_id'] = '60';
+    };
+};
+foreach (array('absent', 'empty') as $start) {
+    foreach (array('before the write', 'before the read-back') as $moment) {
+        $label = 'Default fill, row ' . $start . ', editor picks ' . $moment . ': ';
+        $post_id = broadstreet_new_post($start === 'empty' ? array('bs_sponsor_advertiser_id' => '') : array());
+        $read_back = $editor_picks($post_id);
+        if ($moment === 'before the write') {
+            $broadstreet_before_meta_write = $read_back;
+        } else {
+            // Right after the fill's write lands, before it reads back.
+            add_action($start === 'empty' ? 'updated_post_meta' : 'added_post_meta', function () use (&$read_back) {
+                if ($read_back !== null) {
+                    $callback = $read_back;
+                    $read_back = null;
+                    $callback();
+                }
+            });
+        }
+        $client->calls = array();
+        $status = $sync->sync($post_id);
+        broadstreet_assert_same(null, $moment === 'before the write' ? $broadstreet_before_meta_write : $read_back, $label . 'the race should have run.');
+        broadstreet_assert_same('synced', $status['state'], $label . 'the post should sync.');
+        broadstreet_assert_same('60', get_post_meta($post_id, 'bs_sponsor_advertiser_id', true), $label . 'the editor\'s advertiser must be kept.');
+        broadstreet_assert_same(
+            array(array('getNetwork', '7'), array('createAdvertisement', '60', $post_id)),
+            $client->calls,
+            $label . 'the tracker should be created under the editor\'s advertiser.'
+        );
+        broadstreet_assert_same('60', get_post_meta($post_id, Broadstreet_Sponsor_Sync::META_REMOTE_ADVERTISER, true), $label . 'the tracker should be stamped with the editor\'s advertiser.');
+    }
+}
+broadstreet_install_hooks($core, $client);
+$sync = $core->getSponsorSync();
+add_filter('broadstreet_sponsor_sync_decision', function ($decision, $post_id) use (&$answer) {
+    return $answer;
+}, 10, 2);
+
+// With no race, an empty row is filled by the conditional UPDATE, announced
+// like update_metadata() does, and read back from a cleared cache.
+$post_id = broadstreet_new_post(array('bs_sponsor_advertiser_id' => ''));
+$announced = array();
+add_action('updated_post_meta', function ($meta_id, $object_id, $key, $value) use (&$announced) {
+    $announced[] = array($object_id, $key, $value);
+}, 10, 4);
+$wpdb->queries = array();
+$broadstreet_cache_deletes = 0;
+$status = $sync->sync($post_id);
+broadstreet_assert_same('synced', $status['state'], 'An empty row should take the default.');
+broadstreet_assert_same('77', get_post_meta($post_id, 'bs_sponsor_advertiser_id', true), 'The default should fill the empty row.');
+broadstreet_assert_same(array(array($post_id, 'bs_sponsor_advertiser_id', '77')), $announced, 'The conditional UPDATE should fire updated_post_meta.');
+broadstreet_assert_same(2, count($wpdb->queries), 'An empty row should be filled with one SELECT and one conditional UPDATE.');
+broadstreet_assert_same(3, $broadstreet_cache_deletes, 'The meta cache should be cleared before the check, after the write and before the read-back.');
+
+// An empty row whose conditional UPDATE fails is a retryable error, no HTTP.
+$post_id = broadstreet_new_post(array('bs_sponsor_advertiser_id' => ''));
+$broadstreet_meta_write_failures[$post_id]['bs_sponsor_advertiser_id'] = true;
+$client->calls = array();
+$status = $sync->sync($post_id);
+broadstreet_assert_same(array('error', true), array($status['state'], $status['retryable']), 'An unfilled empty row should be a retryable error.');
+broadstreet_assert_same(array(), $client->calls, 'An unfilled empty row must not reach the API.');
+
+// Hold, then release: the post stays waiting until something syncs it, and
+// then syncs, whether the filter answers null or a default.
+foreach (array('null' => null, 'default' => array('advertiser_id' => '77', 'source' => 'default')) as $name => $release) {
+    foreach (array('explicit retry', 'programmatic sync') as $how) {
+        $label = 'Hold released to ' . $name . ', then ' . $how . ': ';
+        $post_id = broadstreet_new_post($name === 'null' ? array('bs_sponsor_advertiser_id' => '50') : array());
+        $answer = array('hold' => 'Waiting for approval.');
+        $client->calls = array();
+        broadstreet_assert_same('waiting', $sync->sync($post_id)['state'], $label . 'the hold should apply first.');
+        $answer = $release;
+        $status = get_post_meta($post_id, Broadstreet_Sponsor_Sync::META_STATUS, true);
+        broadstreet_assert_same(array('waiting', false), array($status['state'], $status['retryable']), $label . 'a released hold stays waiting until something syncs.');
+        broadstreet_assert_same(array(), $client->calls, $label . 'releasing a hold does not reach the API by itself.');
+        $status = $how === 'explicit retry' ? $sync->sync($post_id, true) : $core->syncSponsorPost($post_id);
+        $advertiser_id = $name === 'null' ? '50' : '77';
+        broadstreet_assert_same('synced', $status['state'], $label . 'the post should sync.');
+        broadstreet_assert_same(
+            array(array('getNetwork', '7'), array('createAdvertisement', $advertiser_id, $post_id)),
+            $client->calls,
+            $label . 'the tracker should be created.'
+        );
+    }
+}
+
+// A malformed answer recovers the same way once the callback is fixed.
+$post_id = broadstreet_new_post(array('bs_sponsor_advertiser_id' => '50'));
+$answer = array('advertiser_id' => '77');
+broadstreet_assert_same('error', $sync->sync($post_id)['state'], 'A malformed answer should record an error.');
+$answer = null;
+broadstreet_assert_same('synced', $core->syncSponsorPost($post_id)['state'], 'A fixed callback and a sync should recover the post.');
 
 // Disabled posts and Rewrite & Republish drafts never ask.
 $asked = 0;

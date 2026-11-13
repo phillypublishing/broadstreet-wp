@@ -84,16 +84,17 @@ class Broadstreet_Sponsor_Sync
             );
         }
         if ($decision['action'] === 'default'
-            && !$this->isPositiveId(get_post_meta($post_id, 'bs_sponsor_advertiser_id', true))) {
-            update_post_meta($post_id, 'bs_sponsor_advertiser_id', $decision['advertiser_id']);
-            if ((string) get_post_meta($post_id, 'bs_sponsor_advertiser_id', true) !== $decision['advertiser_id']) {
-                return $this->recordStatus(
-                    $post_id,
-                    'error',
-                    'WordPress could not store the default advertiser for this post. Save or retry to try again.',
-                    true
-                );
-            }
+            && !$this->isPositiveId(get_post_meta($post_id, 'bs_sponsor_advertiser_id', true))
+            // Whatever is stored now wins: the default, or an advertiser an
+            // editor picked while it was being written. Only no advertiser
+            // at all is a failure.
+            && !$this->isPositiveId($this->fillDefaultAdvertiser($post_id, $decision['advertiser_id']))) {
+            return $this->recordStatus(
+                $post_id,
+                'error',
+                'WordPress could not store the default advertiser for this post. Save or retry to try again.',
+                true
+            );
         }
 
         $advertiser_id = (string) get_post_meta($post_id, 'bs_sponsor_advertiser_id', true);
@@ -164,14 +165,21 @@ class Broadstreet_Sponsor_Sync
      *   has no advertiser selected, store this one in
      *   bs_sponsor_advertiser_id, then synchronize as usual. An advertiser
      *   already selected is kept, so the filter never overwrites an
-     *   editor's choice, or an advertiser it supplied earlier. The ID is a
-     *   positive integer (int or digit string); 'default' is the only
-     *   source.
+     *   editor's choice, or an advertiser it supplied earlier; the write is
+     *   conditional on the meta being absent or empty, so a pick that lands
+     *   while it runs wins too. The ID is a positive integer (int or digit
+     *   string); 'default' is the only source.
      *
      * Anything else (false, a string, an array with neither key, a bad
      * advertiser ID or another source) records a non-retryable `error`
      * status and does not contact Broadstreet: a plugin that hooks this
      * filter can veto synchronization, so a malformed answer fails closed.
+     * Recovery: fix the callback, then save the post or sync it.
+     *
+     * Nothing re-synchronizes a held post on its own: it stays `waiting`
+     * until the next save, publish or explicit retry. When a hold's reason
+     * clears, the plugin that answered it should sync the post, e.g.
+     * (new Broadstreet_Core())->syncSponsorPost($post_id).
      *
      * @param int $post_id Post ID.
      * @return array action 'sync', 'hold' (with message), 'default' (with
@@ -208,6 +216,53 @@ class Broadstreet_Sponsor_Sync
         }
 
         return array('action' => 'invalid');
+    }
+
+    /**
+     * Store a default advertiser only where there is none, deciding at the
+     * write itself so an editor's concurrent pick is never overwritten: an
+     * empty row is updated with "WHERE meta_value = ''", and a missing row is
+     * added as unique, which fails if one has appeared since. (add_post_meta's
+     * unique check is its own query before the insert, so two inserts racing
+     * inside that window can still both land; the read-back then returns the
+     * first row, as every other reader does.)
+     *
+     * @return string The advertiser stored afterwards, read from the database.
+     */
+    protected function fillDefaultAdvertiser($post_id, $advertiser_id)
+    {
+        global $wpdb;
+        $key = 'bs_sponsor_advertiser_id';
+
+        wp_cache_delete($post_id, 'post_meta');
+        if (!metadata_exists('post', $post_id, $key)) {
+            add_post_meta($post_id, $key, $advertiser_id, true);
+        } else {
+            $meta_id = (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT meta_id FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s AND meta_value = '' ORDER BY meta_id LIMIT 1",
+                $post_id,
+                $key
+            ));
+            if ($meta_id > 0) {
+                $updated = $wpdb->query($wpdb->prepare(
+                    "UPDATE {$wpdb->postmeta} SET meta_value = %s WHERE post_id = %d AND meta_key = %s AND meta_id = %d AND meta_value = ''",
+                    $advertiser_id,
+                    $post_id,
+                    $key,
+                    $meta_id
+                ));
+                if ($updated === 1) {
+                    // What update_metadata() does after a write: drop the
+                    // cache and announce it (core uses this to invalidate
+                    // cached meta queries).
+                    wp_cache_delete($post_id, 'post_meta');
+                    do_action('updated_post_meta', $meta_id, $post_id, $key, $advertiser_id);
+                }
+            }
+        }
+
+        wp_cache_delete($post_id, 'post_meta');
+        return (string) get_post_meta($post_id, $key, true);
     }
 
     /**
