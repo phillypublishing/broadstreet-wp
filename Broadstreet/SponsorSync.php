@@ -20,6 +20,8 @@ class Broadstreet_Sponsor_Sync
     const META_FINGERPRINT = '_bs_sponsor_reconciliation_fingerprint';
     const CREATE_GUARD_PREFIX = 'bs_sponsor_creating_';
     const CREATE_GUARD_TTL = 30;
+    const DECISION_FILTER = 'broadstreet_sponsor_sync_decision';
+    const HOLD_MESSAGE_MAX_LENGTH = 500;
 
     protected $client;
     protected $network_id;
@@ -69,6 +71,32 @@ class Broadstreet_Sponsor_Sync
             );
         }
 
+        $decision = $this->getDecision($post_id);
+        if ($decision['action'] === 'hold') {
+            return $this->recordStatus($post_id, 'waiting', $decision['message'], false);
+        }
+        if ($decision['action'] === 'invalid') {
+            return $this->recordStatus(
+                $post_id,
+                'error',
+                'Another plugin returned an invalid Broadstreet sync decision for this post, so tracking is paused. Check the plugin that hooks broadstreet_sponsor_sync_decision.',
+                false
+            );
+        }
+        if ($decision['action'] === 'default'
+            && !$this->isPositiveId(get_post_meta($post_id, 'bs_sponsor_advertiser_id', true))
+            // Whatever is stored now wins: the default, or an advertiser an
+            // editor picked while it was being written. Only no advertiser
+            // at all is a failure.
+            && !$this->isPositiveId($this->fillDefaultAdvertiser($post_id, $decision['advertiser_id']))) {
+            return $this->recordStatus(
+                $post_id,
+                'error',
+                'WordPress could not store the default advertiser for this post. Save or retry to try again.',
+                true
+            );
+        }
+
         $advertiser_id = (string) get_post_meta($post_id, 'bs_sponsor_advertiser_id', true);
         if (!$this->isPositiveId($advertiser_id)) {
             return $this->recordStatus(
@@ -107,6 +135,148 @@ class Broadstreet_Sponsor_Sync
         }
 
         return $this->updateTracker($post_id, $advertiser_id, $advertisement_id, $title, $url, $type, $explicit, $fingerprint);
+    }
+
+    /**
+     * Ask other plugins whether this sponsored post may synchronize now, and
+     * with which advertiser. Runs on every sync of a sponsored post (REST,
+     * Classic, cron publish and explicit retries), after the Rewrite &
+     * Republish and sponsored checks and before the advertiser is read.
+     *
+     * Filter: broadstreet_sponsor_sync_decision
+     *
+     *     apply_filters('broadstreet_sponsor_sync_decision', null, $post_id)
+     *
+     * Filter arguments:
+     * - null $decision: always null; a callback with no opinion returns it.
+     * - int  $post_id:  the post being synchronized.
+     *
+     * Return one of:
+     * - null: no opinion; the post synchronizes exactly as it would with
+     *   nothing hooked.
+     * - array('hold' => string $message): do not synchronize. The post's
+     *   status becomes `waiting` with $message (plain text; tags are
+     *   stripped, whitespace collapsed, at most 500 characters; an empty or
+     *   non-string value gets a generic message) and Broadstreet is not
+     *   contacted. Applies to explicit retries too, and to a post that
+     *   already has a tracker (it is left as it is). If 'hold' is present,
+     *   it wins over any other key.
+     * - array('advertiser_id' => '123', 'source' => 'default'): if the post
+     *   has no advertiser selected, store this one in
+     *   bs_sponsor_advertiser_id, then synchronize as usual. An advertiser
+     *   already selected is kept, so the filter never overwrites an
+     *   editor's choice, or an advertiser it supplied earlier; the write is
+     *   conditional on the meta being absent or empty, so a pick that lands
+     *   while it runs wins too. The ID is a positive integer (int or digit
+     *   string); 'default' is the only source.
+     *
+     * Anything else (false, a string, an array with neither key, a bad
+     * advertiser ID or another source) records a non-retryable `error`
+     * status and does not contact Broadstreet: a plugin that hooks this
+     * filter can veto synchronization, so a malformed answer fails closed.
+     * Recovery: fix the callback, then save the post or sync it.
+     *
+     * Nothing re-synchronizes a held post on its own: it stays `waiting`
+     * until the next save, publish or explicit retry. When a hold's reason
+     * clears, the plugin that answered it should sync the post, e.g.
+     * (new Broadstreet_Core())->syncSponsorPost($post_id).
+     *
+     * @param int $post_id Post ID.
+     * @return array action 'sync', 'hold' (with message), 'default' (with
+     *               advertiser_id, a string) or 'invalid'.
+     */
+    protected function getDecision($post_id)
+    {
+        $decision = apply_filters(self::DECISION_FILTER, null, $post_id);
+
+        if ($decision === null) {
+            return array('action' => 'sync');
+        }
+
+        if (!is_array($decision)) {
+            return array('action' => 'invalid');
+        }
+
+        if (array_key_exists('hold', $decision)) {
+            $message = is_string($decision['hold']) ? $this->plainText($decision['hold']) : '';
+            return array(
+                'action' => 'hold',
+                'message' => $message !== '' ? $message : 'Broadstreet tracking is on hold for this post.',
+            );
+        }
+
+        if (isset($decision['advertiser_id'], $decision['source'])
+            && $decision['source'] === 'default'
+            && (is_int($decision['advertiser_id']) || is_string($decision['advertiser_id']))
+            && $this->isPositiveId($decision['advertiser_id'])) {
+            return array(
+                'action' => 'default',
+                'advertiser_id' => (string) $decision['advertiser_id'],
+            );
+        }
+
+        return array('action' => 'invalid');
+    }
+
+    /**
+     * Store a default advertiser only where there is none, deciding at the
+     * write itself so an editor's concurrent pick is never overwritten: an
+     * empty row is updated with "WHERE meta_value = ''", and a missing row is
+     * added as unique, which fails if one has appeared since. (add_post_meta's
+     * unique check is its own query before the insert, so two inserts racing
+     * inside that window can still both land; the read-back then returns the
+     * first row, as every other reader does.)
+     *
+     * @return string The advertiser stored afterwards, read from the database.
+     */
+    protected function fillDefaultAdvertiser($post_id, $advertiser_id)
+    {
+        global $wpdb;
+        $key = 'bs_sponsor_advertiser_id';
+
+        wp_cache_delete($post_id, 'post_meta');
+        if (!metadata_exists('post', $post_id, $key)) {
+            add_post_meta($post_id, $key, $advertiser_id, true);
+        } else {
+            $meta_id = (int) $wpdb->get_var($wpdb->prepare(
+                "SELECT meta_id FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s AND meta_value = '' ORDER BY meta_id LIMIT 1",
+                $post_id,
+                $key
+            ));
+            if ($meta_id > 0) {
+                $updated = $wpdb->query($wpdb->prepare(
+                    "UPDATE {$wpdb->postmeta} SET meta_value = %s WHERE post_id = %d AND meta_key = %s AND meta_id = %d AND meta_value = ''",
+                    $advertiser_id,
+                    $post_id,
+                    $key,
+                    $meta_id
+                ));
+                if ($updated === 1) {
+                    // What update_metadata() does after a write: drop the
+                    // cache and announce it (core uses this to invalidate
+                    // cached meta queries).
+                    wp_cache_delete($post_id, 'post_meta');
+                    do_action('updated_post_meta', $meta_id, $post_id, $key, $advertiser_id);
+                }
+            }
+        }
+
+        wp_cache_delete($post_id, 'post_meta');
+        return (string) get_post_meta($post_id, $key, true);
+    }
+
+    /**
+     * Status messages are shown in the editor panel and the Classic meta box;
+     * keep another plugin's hold message to one short line of plain text.
+     */
+    protected function plainText($value)
+    {
+        $value = trim((string) preg_replace('/\s+/', ' ', strip_tags($value)));
+        if (function_exists('mb_substr')) {
+            return mb_substr($value, 0, self::HOLD_MESSAGE_MAX_LENGTH, 'UTF-8');
+        }
+
+        return substr($value, 0, self::HOLD_MESSAGE_MAX_LENGTH);
     }
 
     /**

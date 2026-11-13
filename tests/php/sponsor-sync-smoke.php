@@ -21,6 +21,17 @@ $broadstreet_meta = array();
 $broadstreet_transients = array();
 $broadstreet_titles = array();
 $broadstreet_statuses = array();
+$broadstreet_filter_calls = array();
+
+// Nothing hooks broadstreet_sponsor_sync_decision here: this whole file is
+// the proof that the fork behaves as before when no plugin answers it.
+function apply_filters($hook, $value)
+{
+    global $broadstreet_filter_calls;
+    $args = func_get_args();
+    $broadstreet_filter_calls[] = $args;
+    return $value;
+}
 
 function get_post_meta($post_id, $key = '', $single = false)
 {
@@ -151,12 +162,18 @@ $sync = new Broadstreet_Sponsor_Sync($client, '7');
 $status = $sync->sync(10);
 broadstreet_assert_same('disabled', $status['state'], 'Unsponsored posts should report disabled.');
 broadstreet_assert_same(array(), $client->calls, 'Unsponsored posts must not reach the API.');
+broadstreet_assert_same(array(), $broadstreet_filter_calls, 'Unsponsored posts must not ask for a sync decision.');
 
 // 2. Sponsored without an advertiser waits for editor input.
 $broadstreet_meta[10]['bs_sponsor_is_sponsored'] = '1';
 $status = $sync->sync(10);
 broadstreet_assert_same('waiting', $status['state'], 'A missing advertiser should report waiting.');
 broadstreet_assert_same(array(), $client->calls, 'Waiting posts must not reach the API.');
+broadstreet_assert_same(
+    array(array('broadstreet_sponsor_sync_decision', null, 10)),
+    $broadstreet_filter_calls,
+    'Sponsored posts should ask for a sync decision once, with null and the post ID.'
+);
 
 // 3. First sync with an advertiser creates a tracker and stores its identity.
 $broadstreet_meta[10]['bs_sponsor_advertiser_id'] = '50';
@@ -260,7 +277,9 @@ $broadstreet_meta[20] = array(
     '_bs_sponsor_remote_owner_post_id' => '10',
 );
 $client->calls = array();
+$broadstreet_filter_calls = array();
 $status = $sync->sync(20);
+broadstreet_assert_same(array(), $broadstreet_filter_calls, 'Rewrite & Republish drafts must not ask for a sync decision.');
 broadstreet_assert_same('noop', $status['state'], 'Rewrite & Republish drafts should report a noop.');
 broadstreet_assert_same(array(), $client->calls, 'Rewrite & Republish drafts must not reach the API.');
 broadstreet_assert_same(10, $sync->getRewriteRepublishOriginal(20), 'The draft should expose its original for syncing instead.');

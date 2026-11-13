@@ -128,3 +128,64 @@ locks, and detaches tracker IDs that legacy duplication copied onto multiple
 posts (the oldest post keeps the tracker). `scripts/cleanup-sponsor-meta.php`
 (run via `wp eval-file`, dry-run by default) remains for inspecting what the
 migration would do, or re-running it manually.
+
+## Sponsor sync decision filter
+
+Another plugin can hold a sponsored post's synchronization, or supply its
+default advertiser, through `broadstreet_sponsor_sync_decision`. LebTown's
+companion plugin (`lebtown-advertise`) uses it to keep self-serve posts from
+getting a tracker before approval, and then to give them the advertiser
+mapped from their Newspack sponsor.
+
+```php
+apply_filters( 'broadstreet_sponsor_sync_decision', null, $post_id );
+```
+
+- **Arguments:** the decision, always `null` when the filter starts; the post
+  ID (`int`).
+- **When:** inside `Broadstreet_Sponsor_Sync::sync()`, so on every path that
+  synchronizes (REST saves, Classic saves, publishes including scheduled ones
+  run by cron, and **Retry synchronization**). It runs after the Rewrite &
+  Republish skip and the sponsored check, so posts with tracking off and R&R
+  drafts never ask, and before the advertiser is read.
+
+Return one of:
+
+| Return | Effect |
+|---|---|
+| `null` | No opinion. The post synchronizes exactly as it would with nothing hooked. |
+| `array( 'hold' => 'message' )` | No synchronization and no Broadstreet HTTP. Status becomes `waiting` with the message (made plain text: tags stripped, whitespace collapsed, at most 500 characters; empty or non-string gets a generic message). It also applies to explicit retries and to posts that already have a tracker, which is left as it is. `hold` wins over any other key. |
+| `array( 'advertiser_id' => '123', 'source' => 'default' )` | If the post has no advertiser selected, store this one in `bs_sponsor_advertiser_id`, then synchronize as usual. An advertiser already selected is kept, so the filter never overwrites an editor's choice, or an advertiser it supplied earlier; to change one, write the meta. The ID is a positive integer (`int` or digit string); `default` is the only source. |
+| Anything else | A non-retryable `error` status and no Broadstreet HTTP. A hooked plugin can veto synchronization, so a malformed answer (`false`, an empty array, a bad ID, another `source`) fails closed. |
+
+The default never overwrites an editor's pick, even one saved while the
+default is being written. The write itself is conditional:
+
+- an existing empty row is filled by `UPDATE … WHERE meta_value = ''`;
+- a missing row is added with `add_post_meta( …, true )`, which fails if a
+  row has appeared since.
+
+The post then synchronizes with whatever the database holds afterwards: the
+default, or the editor's advertiser. Only an empty result is a failure: a
+retryable `error`, and nothing is sent. (`add_post_meta`'s unique check is a
+query before its insert, so two inserts inside that window can still both
+land. Reads then return the first row, as everywhere else in WordPress.)
+
+**Recovering from a hold or a malformed answer is the caller's job.** A held
+post stays `waiting` with `retryable: false`, and a malformed answer leaves a
+non-retryable `error`. Nothing re-synchronizes either on its own: the post
+recovers only on its next save, publish or explicit retry.
+
+- When a hold's reason clears, the plugin that answered the filter must
+  synchronize the post itself, e.g.
+  `( new Broadstreet_Core() )->syncSponsorPost( $post_id )`. The constructor
+  registers no hooks. The companion does this in its approval step 5 and its
+  sweep.
+- After a malformed answer, fix the callback, then save the post or
+  synchronize it the same way.
+
+With nothing hooked, `apply_filters` returns `null` and behavior is unchanged;
+`tests/php/sponsor-sync-smoke.php` runs the whole synchronizer that way. The
+three answers are covered through the real REST, Classic and cron paths, with
+the fake client from `broadstreet_sponsor_client`, in
+`tests/php/sponsor-sync-decision-smoke.php`.
